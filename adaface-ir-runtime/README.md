@@ -69,13 +69,15 @@ close; `IRON_XRT_CTX_CACHE` overrides the resident-context cap (default 16).
   `libxrt_coreutil`. No cargo crates at all, so it builds offline.
 - At link time the flags propagate to your binary automatically. The
   **rpath does not** (cargo drops `rustc-link-arg` across crates): either
-  run with XRT's `setup.sh` sourced (`LD_LIBRARY_PATH`), or re-emit the
-  rpath in your own `build.rs` from the metadata this crate publishes via
-  its `links = "ironxrt"` key:
+  run with XRT's `setup.sh` sourced (`LD_LIBRARY_PATH`), or emit the rpaths
+  in your own `build.rs` — `$ORIGIN/lib` for the portable layout below,
+  plus the installed-XRT libdir this crate publishes via its
+  `links = "ironxrt"` key (this is what the `run_ir*` binaries do):
 
   ```rust
   // build.rs of your app
   fn main() {
+      println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
       if let Ok(lib) = std::env::var("DEP_IRONXRT_LIBDIR") {
           println!("cargo:rustc-link-arg=-Wl,-rpath,{lib}");
       }
@@ -86,6 +88,38 @@ close; `IRON_XRT_CTX_CACHE` overrides the resident-context cap (default 16).
   bundle directory. The bundle is plain data (~10 MB of xclbins/insts plus
   the bf16 weights — ~25 MB for IR-18, ~130 MB for IR-101); ship it next to
   your binary and pass its path to `IrEmbedder::load`.
+
+### Portable deployment (no XRT install on the target)
+
+Static linking of XRT is not possible with stock XRT: the NPU backend
+(`libxrt_driver_xdna.so`, from the amd/xdna-driver repo) is shared-only and
+is *discovered* at run time — XRT locates its root via `dladdr()` on
+`libxrt_coreutil.so` (on Linux `XILINX_XRT` is ignored), then scans that
+same `lib/` directory for `libxrt_driver_*.so.2` and `dlopen`s them. But
+that exact mechanism makes a fully self-contained app directory work with
+no install, no environment variables:
+
+```
+myapp/
+  run_ir101              (rpath $ORIGIN/lib)
+  lib/libxrt_coreutil.so.2
+  lib/libxrt_driver_xdna.so.2
+  lib/libxrt_core.so.2   (dependency of the plugin)
+  bundle/...
+```
+
+`package_portable.sh <binary> <outdir> [bundle_dir]` (in this directory)
+assembles it from an installed XRT (`$XRT_ROOT`, default `/opt/xilinx/xrt`).
+The `lib/` **subdirectory** is load-bearing — XRT strips the lib component
+from coreutil's location to find its root, so the `.so` files must not sit
+beside the binary.
+
+Verified on NPU2: the packaged directory runs IR-101 inference in a stock
+`ubuntu:24.04` container (no `/opt/xilinx`, no XRT packages, no
+`LD_LIBRARY_PATH`) with identical results. What the target still needs, and
+what can never be linked in: the amdxdna kernel driver + NPU firmware,
+access to `/dev/accel/accel0`, a sufficient memlock limit, and distro
+basics (glibc, `libstdc++`, `libuuid`).
 
 ## API summary
 
