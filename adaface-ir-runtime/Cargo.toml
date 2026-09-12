@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "adaface-ir-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Embeddable Rust runtime replaying exported AdaFace IR bundles on the NPU via XRT (no Python)"
+# `links` lets dependents read DEP_IRONXRT_LIBDIR in their build scripts (the
+# rpath link-arg does not propagate across crates; see build.rs).
+links = "ironxrt"
+
+# Zero external crates: build.rs compiles the C++ XRT shim with g++, and the
+# code uses only std. Builds offline.
+
+[lib]
+name = "adaface_ir_runtime"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3

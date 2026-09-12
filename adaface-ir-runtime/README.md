@@ -1,0 +1,113 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# adaface-ir-runtime
+
+An **embeddable**, zero-dependency Rust library that runs AdaFace IR face
+embedders (IR-18, IR-101) on the AIE NPU with no Python at inference time.
+It replays a *bundle* — compiled conv kernels, packed weights, and a flat
+op plan — exported ahead of time by
+`iron/applications/adaface_ir18/export_ir18.py` /
+`iron/applications/adaface_ir101/export_ir101.py` (iron acts purely as an
+AOT compiler). The `run_ir18` / `run_ir101` binaries under the app
+directories are thin CLI wrappers over this crate.
+
+## Using it from another Rust app
+
+```toml
+[dependencies]
+adaface-ir-runtime = { path = ".../iron/rust/adaface-ir-runtime" }  # or a git dep
+```
+
+```rust
+use adaface_ir_runtime::IrEmbedder;
+
+fn main() -> Result<(), adaface_ir_runtime::Error> {
+    // Load once at startup; keep it for the life of the process.
+    let mut emb = IrEmbedder::load("/path/to/ir101_bundle")?;
+
+    // Per face: an aligned 112x112 crop, channel-major (CHW) f32, with the
+    // cvlface preprocessing ((rgb/255) - 0.5) / 0.5. Alignment (landmark
+    // detection + similarity warp) is the caller's job, as with the
+    // original model.
+    let chw: Vec<f32> = vec![0.0; 3 * 112 * 112]; // your image here
+    let embedding = emb.embed(&chw)?; // 512-d face embedding
+
+    // Compare identities by cosine similarity.
+    let _ = adaface_ir_runtime::cosine(&embedding, &embedding);
+    Ok(())
+}
+```
+
+Everything returns `Result<_, Error>` — the library never prints, panics on
+bad bundles, or exits the host process.
+
+### Performance model
+
+The first `embed()` creates one XRT hardware context per distinct conv
+kernel (16 for IR-18/IR-101 — exactly the NPU2's concurrent-context cap) and
+loads weights from disk; the session keeps all of it resident, so **every
+later forward reloads nothing** (measured: IR-18 ~0.15 s, IR-101 ~0.31 s
+warm). This is the whole point of the runtime — so:
+
+- Construct **one** `IrEmbedder` per process and reuse it. A second
+  simultaneous session fights over the 16-context cap and forces reloads.
+- `IrEmbedder` is `Send` but not `Sync`: move it into a worker thread, or
+  share it behind a `Mutex`. Forwards are serialized either way — the NPU
+  path is one hardware queue.
+
+`IRON_XRT_TIMING=1` makes the shim print context/BO/run timing at session
+close; `IRON_XRT_CTX_CACHE` overrides the resident-context cap (default 16).
+
+### Build requirements
+
+- **XRT** headers/libs at `$XRT_ROOT` (default `/opt/xilinx/xrt`) and `g++`
+  at build time: this crate's `build.rs` compiles the bundled C++ shim
+  (`iron_xrt_shim.cpp`, one `xrt::hw_context` LRU) and links
+  `libxrt_coreutil`. No cargo crates at all, so it builds offline.
+- At link time the flags propagate to your binary automatically. The
+  **rpath does not** (cargo drops `rustc-link-arg` across crates): either
+  run with XRT's `setup.sh` sourced (`LD_LIBRARY_PATH`), or re-emit the
+  rpath in your own `build.rs` from the metadata this crate publishes via
+  its `links = "ironxrt"` key:
+
+  ```rust
+  // build.rs of your app
+  fn main() {
+      if let Ok(lib) = std::env::var("DEP_IRONXRT_LIBDIR") {
+          println!("cargo:rustc-link-arg=-Wl,-rpath,{lib}");
+      }
+  }
+  ```
+
+- At run time: the NPU device (`/dev/accel/accel0`, amdxdna driver) and the
+  bundle directory. The bundle is plain data (~10 MB of xclbins/insts plus
+  the bf16 weights — ~25 MB for IR-18, ~130 MB for IR-101); ship it next to
+  your binary and pass its path to `IrEmbedder::load`.
+
+## API summary
+
+| item | purpose |
+|---|---|
+| `IrEmbedder::load(dir)` | parse `plan.txt`, open the NPU device |
+| `embed(&mut self, chw: &[f32])` | embed a caller image (pads channels, rounds to bf16 round-to-nearest-even — bit-identical to torch) |
+| `embed_recorded(&mut self)` | replay the bundle's recorded input (self-check / benchmark) |
+| `input_dims() / embed_dim() / num_conv_dispatches()` | plan properties |
+| `cosine(a, b)` | embedding similarity |
+| `cli(net_name)` | the whole `run_ir*` CLI, built on the API above |
+| `Error` | `Io` / `Plan` / `Xrt` / `Input` |
+
+## Correctness
+
+The exporter records the plan by *running* the Python NPU implementation, so
+the plan and Python share numerics; `expected.bin` (recorder embedding) and
+`ref.bin` (fp32 CPU reference) ride along in the bundle, and the CLI checks
+both every run. `input_chw.bin` (the raw f32 input) additionally routes
+through the public `embed()` API — its pad + round + tile path reproduces
+the recorded replay bit-for-bit (verified cosine 1.00000 on NPU2 for both
+IR-18 and IR-101; cosine vs the fp32 reference is 0.9993 / 0.9974).
+
+See `iron/applications/adaface_ir18/README.md` for how the network maps onto
+NPU kernels and why the glue/head run on the CPU.
