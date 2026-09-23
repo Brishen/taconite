@@ -3,13 +3,14 @@ SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# `taconite` — replay IRON kernels through XRT from Rust
+# `taconite` — replay IRON kernels on the NPU from Rust
 
 [IRON](https://github.com/amd/IRON) is an ahead-of-time compiler. What it
 leaves behind for a kernel is an `.xclbin` plus an instruction stream
-(`*.insts.bin`). This crate runs those through a small C shim
+(`*.insts.bin`). This crate runs those two ways: through a small C shim
 over XRT's C++ API (`iron_xrt_shim.cpp`, compiled by `build.rs` with no `cc`
-crate, so it builds offline). It provides three types:
+crate, so it builds offline), or with no XRT at all through the `amdxdna`
+driver's ioctls (`direct`, below). Both provide the same three types:
 
 - **`Session`**: the NPU.
 - **`Kernel`**: a resident hardware context, shared by every kernel loaded

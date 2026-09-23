@@ -93,7 +93,7 @@ preprocess ~50, the patch embedding ~30). Loading the bundle takes 0.7 s
 # the bundle (in the NPU container, see the Python app)
 python -m iron.applications.clip_vit_h14.export_clip --out bundle --ref ref_coarse.npz --ref ref_fine.npz
 
-# the binary (links XRT; see the taconite crate)
+# the binary (links XRT; see below for the XRT-free build)
 cargo install taconite-clip
 clip check bundle
 ```

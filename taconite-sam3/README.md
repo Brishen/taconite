@@ -109,7 +109,7 @@ Host buffers of the NPU are touched only through bulk parallel copies
 python -m iron.applications.sam3.export_sam3 --out bundle --model /path/to/sam3 \
     --image cats.jpg --prompt cat --case cats.jpg:cat:ref_cats.npz ...
 
-# 2. The runtime (links XRT; see the taconite crate)
+# 2. The runtime (links XRT; see below for the XRT-free build)
 cargo install taconite-sam3
 
 # 3. Run

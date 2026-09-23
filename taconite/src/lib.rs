@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Replaying [IRON](https://github.com/amd/iron) kernels on an AMD XDNA NPU
-//! from Rust, through XRT.
+//! from Rust, through XRT or directly through the `amdxdna` driver.
 //!
 //! IRON is an ahead-of-time compiler: a kernel is an `.xclbin` (the array
 //! configuration and the cores' programs) plus an instruction stream for the

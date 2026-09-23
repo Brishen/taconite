@@ -19,14 +19,16 @@ references), and `kernels/`. `export_gaic.py`'s docstring lists every record
 and tensor. Bundles in the older one-file-per-tensor format (`gaic 1`
 manifest) are rejected; re-export them.
 
-XRT is reached through [`taconite`](https://crates.io/crates/taconite), a C
-shim over XRT's C++ API with a `Session` / `Kernel` / `Buffer` interface:
+The NPU is reached through [`taconite`](https://crates.io/crates/taconite),
+over XRT (a C shim over its C++ API) or directly over the `amdxdna` driver's
+ioctls, with the same `Session` / `Kernel` / `Buffer` interface either way:
 hardware contexts stay resident, runs are cached per argument tuple, and
 there are sub-buffers and async launches.
 
 ## Build and run
 
-The host needs XRT and `uuid/uuid.h`; see
+The default (XRT) build needs XRT and `uuid/uuid.h`; the `direct` build
+below needs neither. See
 [`taconite`](https://crates.io/crates/taconite) for how XRT is found and
 linked (dynamically from `$XRT_ROOT`, or statically from `$XRT_STATIC_ROOT`).
 
