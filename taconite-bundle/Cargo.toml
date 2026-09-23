@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "taconite-bundle"
+version = "0.1.0"
+edition = "2024"
+description = "Reads the bundles IRON exporters write for Rust runtimes: manifest.txt records and the tensors.txt/tensors.bin store"
+
+# Deliberately no dependencies (std only, builds offline) and no XRT: a
+# bundle is plain data, so tools that only inspect one need not link XRT.
+[dependencies]

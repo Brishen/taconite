@@ -1,0 +1,118 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+// SPDX-License-Identifier: Apache-2.0
+
+//! The direct path on an NPU, over an element-wise multiply built by the
+//! `eltwise_mul` example (three bf16 buffers of `TACONITE_TEST_ELEMENTS`):
+//!
+//! ```text
+//! TACONITE_TEST_XCLBIN=out/eltwise_mul.xclbin TACONITE_TEST_INSTS=out/eltwise_mul.insts.bin \
+//!   TACONITE_TEST_ELEMENTS=1638400 cargo test --release --test direct_hw -- --ignored
+//! ```
+
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
+use std::path::PathBuf;
+
+use taconite::direct::{Kernel, Session};
+use taconite::{bf16_to_f32, f32_to_bf16};
+
+fn artifacts() -> (PathBuf, PathBuf, usize) {
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k} (see the file's doc)"));
+    (
+        var("TACONITE_TEST_XCLBIN").into(),
+        var("TACONITE_TEST_INSTS").into(),
+        var("TACONITE_TEST_ELEMENTS").parse().unwrap(),
+    )
+}
+
+/// Runs `kernel` on `a * b` for `scale`-shifted inputs and checks every element.
+fn check(device: &Session, kernel: &Kernel, n: usize, scale: f32) {
+    let (mut a, mut b, c) =
+        (device.alloc_of::<u16>(n).unwrap(), device.alloc_of::<u16>(n).unwrap(), device.alloc_of::<u16>(n).unwrap());
+    let xs: Vec<u16> = (0..n).map(|i| f32_to_bf16(((i % 251) as f32 - 125.0) / 32.0 * scale)).collect();
+    let ys: Vec<u16> = (0..n).map(|i| f32_to_bf16(((i % 97) as f32 - 48.0) / 16.0)).collect();
+    a.write(&xs).unwrap();
+    b.write(&ys).unwrap();
+    kernel.run(&[&a, &b, &c]).unwrap();
+    c.sync_from_device().unwrap();
+    for (i, &got) in c.as_slice::<u16>().iter().enumerate() {
+        let want = bf16_to_f32(f32_to_bf16(bf16_to_f32(xs[i]) * bf16_to_f32(ys[i])));
+        let got = bf16_to_f32(got);
+        assert!((got - want).abs() <= 0.04 * want.abs() + 1e-6, "[{i}] {got} != {want}");
+    }
+}
+
+#[test]
+#[ignore = "needs an NPU and a built kernel"]
+fn kernels_load_run_and_release_their_contexts() {
+    let (xclbin, insts, n) = artifacts();
+    let device = Session::open(0).unwrap();
+    let mine = |d: &Session| d.contexts().unwrap().into_iter().filter(|c| c.pid == std::process::id() as i64).count();
+    // More cycles of resident kernels than NPU2 has contexts (16): one that
+    // is not released runs the device out of them.
+    for cycle in 0..20 {
+        // Distinct kernel names get contexts of their own.
+        let kernels: Vec<Kernel> =
+            ["a", "b", "c"].iter().map(|name| device.load_kernel(&xclbin, &insts, Some(name), 0).unwrap()).collect();
+        assert_eq!(mine(&device), 3, "cycle {cycle}");
+        for (i, k) in kernels.iter().enumerate() {
+            check(&device, k, n, 1.0 + i as f32);
+        }
+    }
+    assert_eq!(mine(&device), 0);
+
+    // The same xclbin and name share one, as with XRT.
+    let (k1, k2) =
+        (device.load_kernel(&xclbin, &insts, None, 0).unwrap(), device.load_kernel(&xclbin, &insts, None, 0).unwrap());
+    assert_eq!(mine(&device), 1);
+    check(&device, &k1, n, 1.0);
+    check(&device, &k2, n, 2.0);
+    drop(k1);
+    assert_eq!(mine(&device), 1);
+    drop(k2);
+    assert_eq!(mine(&device), 0);
+}
+
+/// Sub-buffers of one allocation as the arguments of several runs in
+/// flight at once — how the models chunk a big matrix through one kernel.
+#[test]
+#[ignore = "needs an NPU and a built kernel"]
+fn sub_buffers_and_runs_in_flight() {
+    let (xclbin, insts, n) = artifacts();
+    let device = Session::open(0).unwrap();
+    let kernel = device.load_kernel(&xclbin, &insts, None, 0).unwrap();
+    const CHUNKS: usize = 4;
+    let (mut a, mut b, c) = (
+        device.alloc_of::<u16>(n * CHUNKS).unwrap(),
+        device.alloc_of::<u16>(n).unwrap(),
+        device.alloc_of::<u16>(n * CHUNKS).unwrap(),
+    );
+    let xs: Vec<u16> = (0..n * CHUNKS).map(|i| f32_to_bf16(((i % 211) as f32 - 105.0) / 16.0)).collect();
+    let ys: Vec<u16> = (0..n).map(|i| f32_to_bf16(((i % 89) as f32 - 44.0) / 8.0)).collect();
+    a.write(&xs).unwrap();
+    b.write(&ys).unwrap();
+    let parts: Vec<_> =
+        (0..CHUNKS).map(|i| (a.sub_of::<u16>(i * n, n).unwrap(), c.sub_of::<u16>(i * n, n).unwrap())).collect();
+    let runs: Vec<_> = parts.iter().map(|(ai, ci)| kernel.start(&[ai, &b, ci]).unwrap()).collect();
+    for r in runs {
+        r.wait().unwrap();
+    }
+    c.sync_from_device().unwrap();
+    for (i, &got) in c.as_slice::<u16>().iter().enumerate() {
+        let want = bf16_to_f32(f32_to_bf16(bf16_to_f32(xs[i]) * bf16_to_f32(ys[i % n])));
+        let got = bf16_to_f32(got);
+        assert!((got - want).abs() <= 0.04 * want.abs() + 1e-6, "[{i}] {got} != {want}");
+    }
+    assert!(a.sub(n * CHUNKS * 2, 2).is_err());
+}
+
+#[test]
+#[ignore = "needs an NPU and a built kernel"]
+fn too_many_arguments_is_an_error_not_a_submission() {
+    let (xclbin, insts, _) = artifacts();
+    let device = Session::open(0).unwrap();
+    let kernel = device.load_kernel(&xclbin, &insts, None, 0).unwrap();
+    let bufs: Vec<_> = (0..6).map(|_| device.alloc(4096).unwrap()).collect();
+    let refs: Vec<_> = bufs.iter().collect();
+    assert!(matches!(kernel.run(&refs), Err(taconite::Error::Run(_))));
+}

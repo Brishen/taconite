@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "taconite-clip"
+version = "0.1.0"
+edition = "2024"
+description = "CLIP ViT-H/14 image and text embeddings / zero-shot classification on an AMD XDNA NPU: IRON kernels replayed through XRT, no Python"
+
+[features]
+default = ["cli", "xrt"]
+# The `clip` binary: decodes images (the `image` crate). The library itself
+# is std-only.
+cli = ["dep:image"]
+# Run the kernels through XRT (taconite's `xrt` feature: XRT's headers and
+# library at build time).
+xrt = ["taconite/xrt", "taconite-sam3/xrt"]
+# Run the kernels through the amdxdna driver's ioctls (`taconite::direct`)
+# instead of XRT; it wins when both are on. For a build with no XRT at all:
+# `--no-default-features --features cli,direct`.
+direct = ["taconite-sam3/direct"]
+
+[dependencies]
+taconite-bundle = { path = "../taconite-bundle" }
+taconite = { path = "../taconite", default-features = false }
+# the CLIP BPE tokenizer and the threaded host-math helpers
+taconite-sam3 = { path = "../taconite-sam3", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+
+[[bin]]
+name = "clip"
+required-features = ["cli"]
+
+[profile.release]
+debug = 1
