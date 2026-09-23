@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use iron_bundle::{Manifest, Store};
-use iron_xrt::Buffer;
+use npu::Buffer;
 pub use sam3::Timing;
 use sam3::cpu::{dot, ln_row, par_rows};
 use sam3::tokenizer::Tokenizer;

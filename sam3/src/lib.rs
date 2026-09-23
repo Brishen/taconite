@@ -26,7 +26,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use iron_xrt::Buffer;
+use npu::Buffer;
 
 pub mod bundle;
 pub mod cpu;

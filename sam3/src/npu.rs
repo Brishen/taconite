@@ -12,7 +12,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use iron_xrt::{Buffer, Kernel, Session};
+// The NPU path: XRT, or the driver's ioctls with no XRT (feature `direct`).
+#[cfg(feature = "direct")]
+pub use iron_xrt::direct::{Buffer, Kernel, Session};
+#[cfg(not(feature = "direct"))]
+pub use iron_xrt::{Buffer, Kernel, Session};
 
 use crate::Error;
 use crate::bundle::{GemmSpec, Manifest, MhaSpec};

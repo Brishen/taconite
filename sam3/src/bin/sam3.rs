@@ -316,7 +316,7 @@ fn segment(args: &[String]) -> R<()> {
 
 /// Host <-> device-buffer copy rates (the host mapping of an XRT BO).
 fn bench_copy() -> R<()> {
-    let s = iron_xrt::Session::open(0)?;
+    let s = sam3::npu::Session::open(0)?;
     let n = 16 << 20; // u16s = 32 MB
     let mut b = s.alloc_of::<u16>(n)?;
     let src = vec![1u16; n];

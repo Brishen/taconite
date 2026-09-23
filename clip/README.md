@@ -98,6 +98,11 @@ cargo build --release
 ./target/release/clip check bundle
 ```
 
+To run without XRT, build with `--features direct`. The kernels then go
+through the `amdxdna` driver's ioctls (`iron_xrt::direct`). On NPU2, `check`
+prints the same numbers as the XRT build, at the same speed (~1.29 s for 4
+images × 8 labels).
+
 The bundle (1.3 GiB) holds every kernel, the packed weights, the tokenizer,
 the reference sets and their images; its format is `iron-bundle`'s plus
 the records `export_clip.py`'s docstring lists.

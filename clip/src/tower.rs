@@ -15,11 +15,11 @@
 use std::time::Instant;
 
 use iron_bundle::Store;
-use iron_xrt::{Buffer, bf16_to_f32, f32_to_bf16};
+use iron_xrt::{bf16_to_f32, f32_to_bf16};
 use sam3::Timing;
 use sam3::cpu::{ln_row, par_rows};
 
-use crate::npu::{BF16, Io, Npu};
+use crate::npu::{BF16, Buffer, Io, Npu};
 use crate::{Error, pull, push};
 
 pub struct Tower {

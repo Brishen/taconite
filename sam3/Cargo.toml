@@ -12,6 +12,9 @@ default = ["cli"]
 # The `sam3` binary: decodes images (the `image` crate) and writes overlays.
 # The library itself is std-only.
 cli = ["dep:image"]
+# Run the kernels through the amdxdna driver's ioctls (`iron_xrt::direct`)
+# instead of XRT.
+direct = []
 
 [dependencies]
 iron-bundle = { path = "../iron-bundle" }

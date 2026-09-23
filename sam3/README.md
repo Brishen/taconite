@@ -116,6 +116,10 @@ cargo build --release
 The bundle is ~1.5 GB: the NPU weights pre-packed (bfp16), the text
 encoder's in bf16, everything else f32, plus the reference tensors.
 
+To run without XRT, build with `--features direct`. The kernels then go
+through the `amdxdna` driver's ioctls (`iron_xrt::direct`). On NPU2, `check`
+prints the same numbers as the XRT build, at the same speed (~2.6 s a case).
+
 ## Limits
 
 - Image + text prompts. Box prompts (the geometry encoder) and the video /
