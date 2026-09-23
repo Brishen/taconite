@@ -10,12 +10,15 @@ description = "Embeddable Rust runtime replaying exported AdaFace IR bundles on 
 # rpath link-arg does not propagate across crates; see build.rs).
 links = "ironxrt"
 
-# Zero external crates: build.rs compiles the C++ XRT shim with g++, and the
-# code uses only std. Builds offline.
+# No external crates: build.rs compiles the C++ XRT shim with g++, and the
+# code uses std plus the in-repo (std-only) bundle reader. Builds offline.
 
 [lib]
 name = "adaface_ir_runtime"
 path = "src/lib.rs"
+
+[dependencies]
+iron-bundle = { path = "../iron-bundle" }
 
 [profile.release]
 opt-level = 3

@@ -6,10 +6,11 @@
 //!
 //! [`IrEmbedder`] replays a bundle exported by
 //! `iron/applications/adaface_ir18/export_ir18.py` (or the IR-101 wrapper
-//! `export_ir101.py`). The plan format is architecture-agnostic, so this one
-//! runtime serves every exported IR backbone; the `run_ir18` / `run_ir101`
-//! binaries are thin wrappers over [`cli`], which is itself a consumer of the
-//! public API:
+//! `export_ir101.py`): the shared IRON bundle format (read with
+//! `iron-bundle`), whose manifest lists the network's steps in order. The
+//! steps encode the architecture, so this one runtime serves every exported
+//! IR backbone; the `run_ir18` / `run_ir101` binaries are thin wrappers over
+//! [`cli`], which is itself a consumer of the public API:
 //!
 //! ```no_run
 //! use adaface_ir_runtime::IrEmbedder;
@@ -17,8 +18,8 @@
 //! # fn main() -> Result<(), adaface_ir_runtime::Error> {
 //! let mut emb = IrEmbedder::load("/path/to/bundle")?;
 //! // An aligned 112x112 face crop, CHW f32, cvlface preprocessing
-//! // ((rgb/255) - 0.5) / 0.5. Channels beyond the image's (the plan pads the
-//! // stem to a multiple of 8) are zero-filled internally.
+//! // ((rgb/255) - 0.5) / 0.5. Channels beyond the image's (the bundle pads
+//! // the stem to a multiple of 8) are zero-filled internally.
 //! let chw = vec![0f32; 3 * 112 * 112];
 //! let embedding = emb.embed(&chw)?; // 512-d
 //! # let _ = embedding;
@@ -26,12 +27,13 @@
 //! # }
 //! ```
 //!
+//! Loading reads every weight into RAM and checks every step against them.
 //! The first forward creates one XRT hardware context per distinct conv
 //! kernel (16 for IR-18/IR-101) and the session keeps them ALL resident (LRU
 //! cache in the C++ shim, sized to the NPU2's 16-concurrent-context cap), so
-//! every later forward reloads nothing. Weights/params are cached in RAM on
-//! first use. Keep ONE `IrEmbedder` alive for the process and reuse it; a
-//! second simultaneous session would fight over the context cap.
+//! every later forward reloads nothing. Keep ONE `IrEmbedder` alive for the
+//! process and reuse it; a second simultaneous session would fight over the
+//! context cap.
 //!
 //! Pipeline per forward (all in Rust):
 //!   * every convolution on the NPU via the XRT shim, in the Conv2d
@@ -56,6 +58,11 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use iron_bundle::{DType, Manifest, Record, Store};
+
+/// The bundle format version this runtime reads (`export_ir18.VERSION`).
+pub const BUNDLE_VERSION: u32 = 1;
+
 // ----------------------------------------------------------------------------
 // Errors
 // ----------------------------------------------------------------------------
@@ -66,7 +73,8 @@ use std::path::{Path, PathBuf};
 pub enum Error {
     /// A bundle file could not be read.
     Io(PathBuf, std::io::Error),
-    /// plan.txt is malformed or references an undefined buffer.
+    /// The bundle is malformed or inconsistent: a bad manifest record, a
+    /// missing or mis-sized tensor, a step reading an undefined buffer.
     Plan(String),
     /// The XRT shim reported a device/kernel error.
     Xrt(String),
@@ -78,7 +86,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(p, e) => write!(f, "cannot read {}: {e}", p.display()),
-            Error::Plan(s) => write!(f, "bad plan: {s}"),
+            Error::Plan(s) => write!(f, "bad bundle: {s}"),
             Error::Xrt(s) => write!(f, "XRT: {s}"),
             Error::Input(s) => write!(f, "bad input: {s}"),
         }
@@ -86,6 +94,15 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<iron_bundle::Error> for Error {
+    fn from(e: iron_bundle::Error) -> Self {
+        match e {
+            iron_bundle::Error::Io(p, e) => Error::Io(p, e),
+            iron_bundle::Error::Format(m) => Error::Plan(m),
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------
 // FFI to the XRT shim (persistent session; LRU cache of resident hw_contexts)
@@ -139,7 +156,13 @@ impl Xrt {
 
     /// Ensure `key`'s kernel is resident (no-op if already cached; otherwise
     /// created, evicting the LRU context if the cache is full).
-    fn ensure(&mut self, key: &str, xclbin: &Path, insts: &Path, kernel: &str) -> Result<(), Error> {
+    fn ensure(
+        &mut self,
+        key: &str,
+        xclbin: &Path,
+        insts: &Path,
+        kernel: &str,
+    ) -> Result<(), Error> {
         let ck = cstr(key)?;
         let cx = cstr(xclbin.to_str().ok_or_else(|| bad_path(xclbin))?)?;
         let ci = cstr(insts.to_str().ok_or_else(|| bad_path(insts))?)?;
@@ -232,22 +255,6 @@ fn f32_to_bf16(f: f32) -> u16 {
     }
     let rounding_bias = 0x7fff + ((bits >> 16) & 1); // round to nearest even
     ((bits + rounding_bias) >> 16) as u16
-}
-
-fn read_bf16(path: &Path) -> Result<Vec<u16>, Error> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect())
-}
-
-fn read_f32(path: &Path) -> Result<Vec<f32>, Error> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
 }
 
 // ----------------------------------------------------------------------------
@@ -387,34 +394,6 @@ fn tiled_to_nchw_f32(b: &Buf) -> Vec<f32> {
     out
 }
 
-// ----------------------------------------------------------------------------
-// Plan parsing
-// ----------------------------------------------------------------------------
-
-fn kv(line: &str) -> (String, HashMap<String, String>) {
-    let mut it = line.split_whitespace();
-    let op = it.next().unwrap_or("").to_string();
-    let mut m = HashMap::new();
-    for tok in it {
-        if let Some((k, v)) = tok.split_once('=') {
-            m.insert(k.to_string(), v.to_string());
-        }
-    }
-    (op, m)
-}
-
-fn gets<'a>(m: &'a HashMap<String, String>, k: &str) -> Result<&'a str, Error> {
-    m.get(k)
-        .map(|s| s.as_str())
-        .ok_or_else(|| Error::Plan(format!("missing key {k}")))
-}
-
-fn geti(m: &HashMap<String, String>, k: &str) -> Result<i64, Error> {
-    gets(m, k)?
-        .parse()
-        .map_err(|_| Error::Plan(format!("bad integer for key {k}")))
-}
-
 /// Cosine similarity between two embeddings (0.0 if either is all-zero).
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
@@ -431,40 +410,287 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 // ----------------------------------------------------------------------------
-// The embedder: replay the recorded IR plan on the NPU
+// The bundle's steps
 // ----------------------------------------------------------------------------
 
-type Op = (String, HashMap<String, String>);
+/// One NPU dispatch: the input-channel group `[8 * c0, 8 * c0 + icg)` of a
+/// convolution, accumulated into `out` from the `first` dispatch to the
+/// `last` (which crops the padded width `owp` back to `ow`).
+struct Conv {
+    input: u32,
+    out: u32,
+    c0: usize,
+    icg: usize,
+    wp: usize,
+    oc: usize,
+    oh: usize,
+    ow: usize,
+    owp: usize,
+    ctx: String,
+    xclbin: PathBuf,
+    kernel: String,
+    insts: PathBuf,
+    wt: String,
+    first: bool,
+    last: bool,
+}
 
-/// Load a bf16 blob into `cache` if not already present (weights/params are
-/// reused verbatim across forwards, so they are read from disk only once).
-fn cache_bf16<'a>(
-    cache: &'a mut HashMap<String, Vec<u16>>,
-    dir: &Path,
-    name: &str,
-) -> Result<&'a [u16], Error> {
-    if !cache.contains_key(name) {
-        cache.insert(name.to_string(), read_bf16(&dir.join(name))?);
+/// One manifest step, parsed and checked against the tensor store at load.
+/// Buffer ids name tiled bf16 buffers; `String`s name tensors.
+enum Step {
+    Input {
+        buf: u32,
+        c: usize,
+        h: usize,
+        w: usize,
+        tensor: String,
+    },
+    Conv(Conv),
+    Affine {
+        input: u32,
+        out: u32,
+        scale: String,
+        shift: String,
+    },
+    PreluBias {
+        buf: u32,
+        alpha: String,
+        bias: String,
+    },
+    Bias {
+        buf: u32,
+        bias: String,
+    },
+    Subsample {
+        input: u32,
+        out: u32,
+        stride: usize,
+    },
+    Add {
+        a: u32,
+        b: u32,
+        out: u32,
+    },
+    Head {
+        input: u32,
+        k: usize,
+        n: usize,
+        bt: String,
+        b2: String,
+    },
+}
+
+/// (channels, height, width) of a buffer.
+type Shape = (usize, usize, usize);
+
+/// A buffer a step reads: `key=<id>`, which an earlier step must define.
+fn read(shapes: &HashMap<u32, Shape>, r: &Record, key: &str) -> Result<(u32, Shape), Error> {
+    let id: u32 = r.get(key)?;
+    match shapes.get(&id) {
+        Some(&s) => Ok((id, s)),
+        None => Err(r
+            .error(format!("{key}={id} is not a defined buffer here"))
+            .into()),
     }
-    Ok(&cache[name])
 }
 
-fn getbuf<'a>(bufs: &'a HashMap<u32, Buf>, id: u32, op: &str) -> Result<&'a Buf, Error> {
-    bufs.get(&id)
-        .ok_or_else(|| Error::Plan(format!("{op}: buffer {id} undefined")))
+fn dims(r: &Record) -> Result<Shape, Error> {
+    Ok((r.get("c")?, r.get("h")?, r.get("w")?))
 }
+
+fn same(r: &Record, what: &str, got: Shape, want: Shape) -> Result<(), Error> {
+    if got != want {
+        return Err(r
+            .error(format!(
+                "{what} is {got:?} (c, h, w), the step says {want:?}"
+            ))
+            .into());
+    }
+    Ok(())
+}
+
+/// Tensor `key=<name>`, checked to be `elems` x `dtype`.
+fn tensor(
+    store: &Store,
+    r: &Record,
+    key: &str,
+    dtype: DType,
+    elems: usize,
+) -> Result<String, Error> {
+    let name = r.str(key)?;
+    store.expect(name, dtype, elems).map_err(|e| r.error(e))?;
+    Ok(name.to_string())
+}
+
+/// Parse the manifest's steps, checking each against the buffers the steps
+/// before it define and against the tensors, so a forward cannot fail on
+/// a malformed bundle.
+fn parse_steps(m: &Manifest, store: &Store) -> Result<Vec<Step>, Error> {
+    let mut shapes: HashMap<u32, Shape> = HashMap::new();
+    let mut steps = Vec::new();
+    for r in m.records() {
+        let step = match r.tag.as_str() {
+            "input" => {
+                let (c, h, w) = dims(r)?;
+                if c == 0 || c % 8 != 0 || h == 0 || w == 0 {
+                    return Err(r
+                        .error("c must be a positive multiple of 8, h and w positive")
+                        .into());
+                }
+                let tensor = tensor(store, r, "tensor", DType::Bf16, c * h * w)?;
+                let buf = r.get("buf")?;
+                shapes.insert(buf, (c, h, w));
+                Step::Input {
+                    buf,
+                    c,
+                    h,
+                    w,
+                    tensor,
+                }
+            }
+            "conv" => {
+                let (input, s) = read(&shapes, r, "in")?;
+                let (ict, h, w): Shape = (r.get("ict")?, r.get("h")?, r.get("w")?);
+                same(r, "the input", s, (ict, h, w))?;
+                let (c0, icg, wp): (usize, usize, usize) =
+                    (r.get("c0")?, r.get("icg")?, r.get("wp")?);
+                let (oc, oh, ow, owp): (usize, usize, usize, usize) =
+                    (r.get("oc")?, r.get("oh")?, r.get("ow")?, r.get("owp")?);
+                if icg == 0
+                    || icg % 8 != 0
+                    || 8 * c0 + icg > ict
+                    || oc % 8 != 0
+                    || wp < w
+                    || owp < ow
+                {
+                    return Err(r
+                        .error("inconsistent channel group or padded widths")
+                        .into());
+                }
+                let x = m.xclbin(r.str("ctx")?).map_err(|e| r.error(e))?;
+                let wt = r.str("wt")?;
+                let e = store.entry(wt).map_err(|e| r.error(e))?;
+                if e.dtype != DType::Bf16 {
+                    return Err(r
+                        .error(format!("tensor {wt} is {:?}, wanted Bf16", e.dtype))
+                        .into());
+                }
+                let (out, last) = (r.get("out")?, r.flag("last")?);
+                if last {
+                    shapes.insert(out, (oc, oh, ow));
+                }
+                Step::Conv(Conv {
+                    input,
+                    out,
+                    c0,
+                    icg,
+                    wp,
+                    oc,
+                    oh,
+                    ow,
+                    owp,
+                    ctx: x.key.clone(),
+                    xclbin: x.path.clone(),
+                    kernel: x.kernel.clone(),
+                    insts: m.path(r.str("insts")?),
+                    wt: wt.to_string(),
+                    first: r.flag("first")?,
+                    last,
+                })
+            }
+            "affine" => {
+                let (input, s) = read(&shapes, r, "in")?;
+                let d = dims(r)?;
+                same(r, "the input", s, d)?;
+                let scale = tensor(store, r, "scale", DType::Bf16, d.0)?;
+                let shift = tensor(store, r, "shift", DType::Bf16, d.0)?;
+                let out = r.get("out")?;
+                shapes.insert(out, d);
+                Step::Affine {
+                    input,
+                    out,
+                    scale,
+                    shift,
+                }
+            }
+            "prelu_bias" => {
+                let (buf, s) = read(&shapes, r, "buf")?;
+                same(r, "the buffer", s, dims(r)?)?;
+                let alpha = tensor(store, r, "alpha", DType::Bf16, s.0)?;
+                let bias = tensor(store, r, "bias", DType::Bf16, s.0)?;
+                Step::PreluBias { buf, alpha, bias }
+            }
+            "bias" => {
+                let (buf, s) = read(&shapes, r, "buf")?;
+                same(r, "the buffer", s, dims(r)?)?;
+                let bias = tensor(store, r, "bias", DType::Bf16, s.0)?;
+                Step::Bias { buf, bias }
+            }
+            "subsample" => {
+                let (input, s) = read(&shapes, r, "in")?;
+                let (c, h, w) = dims(r)?;
+                same(r, "the input", s, (c, h, w))?;
+                let stride: usize = r.get("stride")?;
+                if stride == 0 {
+                    return Err(r.error("stride must be positive").into());
+                }
+                let out = r.get("out")?;
+                shapes.insert(out, (c, h / stride, w / stride));
+                Step::Subsample { input, out, stride }
+            }
+            "add" => {
+                let (a, sa) = read(&shapes, r, "a")?;
+                let (b, sb) = read(&shapes, r, "b")?;
+                let d = dims(r)?;
+                same(r, "a", sa, d)?;
+                same(r, "b", sb, d)?;
+                let out = r.get("out")?;
+                shapes.insert(out, d);
+                Step::Add { a, b, out }
+            }
+            "head" => {
+                let (input, s) = read(&shapes, r, "in")?;
+                let d = dims(r)?;
+                same(r, "the input", s, d)?;
+                let (k, n): (usize, usize) = (r.get("k")?, r.get("n")?);
+                if d.0 * d.1 * d.2 != k {
+                    return Err(r
+                        .error(format!("k={k} is not the input's c * h * w"))
+                        .into());
+                }
+                let bt = tensor(store, r, "bT", DType::Bf16, k * n)?;
+                let b2 = tensor(store, r, "b2", DType::F32, n)?;
+                Step::Head {
+                    input,
+                    k,
+                    n,
+                    bt,
+                    b2,
+                }
+            }
+            other => return Err(r.error(format!("unknown step {other}")).into()),
+        };
+        steps.push(step);
+    }
+    Ok(steps)
+}
+
+// ----------------------------------------------------------------------------
+// The embedder: replay the recorded IR steps on the NPU
+// ----------------------------------------------------------------------------
 
 /// A resident NPU session replaying one exported IR bundle.
 ///
 /// Construct once with [`IrEmbedder::load`], then call [`IrEmbedder::embed`]
-/// per face. The first forward creates the hardware contexts and loads the
-/// weights from disk; every later forward reuses all of it (warm path).
+/// per face. The first forward creates the hardware contexts; every later
+/// forward reuses them (warm path).
 pub struct IrEmbedder {
     xrt: Xrt,
-    dir: PathBuf,
-    ops: Vec<Op>,
-    bcache: HashMap<String, Vec<u16>>,
-    fcache: HashMap<String, Vec<f32>>,
+    store: Store,
+    steps: Vec<Step>,
+    /// Each head's `bT`, widened to f32 once.
+    head_bt: HashMap<String, Vec<f32>>,
+    model: Option<String>,
     in_c: usize, // stem channels as recorded (image channels padded to %8)
     in_h: usize,
     in_w: usize,
@@ -478,48 +704,59 @@ pub struct IrEmbedder {
 unsafe impl Send for IrEmbedder {}
 
 impl IrEmbedder {
-    /// Parse `<bundle>/plan.txt` and open the NPU device. Hardware contexts
-    /// and weights load lazily on the first forward.
+    /// Read and check the bundle (manifest, every tensor), then open the NPU
+    /// device. Hardware contexts load lazily on the first forward.
     pub fn load(bundle_dir: impl AsRef<Path>) -> Result<Self, Error> {
-        let dir = bundle_dir.as_ref().to_path_buf();
-        let plan_path = dir.join("plan.txt");
-        let plan =
-            std::fs::read_to_string(&plan_path).map_err(|e| Error::Io(plan_path.clone(), e))?;
-        let ops: Vec<Op> = plan
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(kv)
+        let dir = bundle_dir.as_ref();
+        if !dir.join(Manifest::FILE).exists() && dir.join("plan.txt").exists() {
+            return Err(Error::Plan(format!(
+                "{} is an old plan.txt bundle; re-export it with export_ir18.py / export_ir101.py",
+                dir.display()
+            )));
+        }
+        let m = Manifest::load(dir, BUNDLE_VERSION)?;
+        let store = Store::load(dir)?;
+        let steps = parse_steps(&m, &store)?;
+        let inputs: Vec<Shape> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Input { c, h, w, .. } => Some((*c, *h, *w)),
+                _ => None,
+            })
             .collect();
-        let (mut in_c, mut in_h, mut in_w, mut embed_dim) = (0usize, 0usize, 0usize, 0usize);
-        for (op, m) in &ops {
-            if op == "INPUT" {
-                in_c = geti(m, "c")? as usize;
-                in_h = geti(m, "h")? as usize;
-                in_w = geti(m, "w")? as usize;
-            } else if op == "HEAD" {
-                embed_dim = geti(m, "n")? as usize;
+        let [(in_c, in_h, in_w)] = inputs[..] else {
+            return Err(Error::Plan(
+                "the bundle needs exactly one input step".into(),
+            ));
+        };
+        let mut head_bt = HashMap::new();
+        let mut embed_dim = None;
+        for s in &steps {
+            if let Step::Head { bt, n, .. } = s {
+                embed_dim = Some(*n);
+                if !head_bt.contains_key(bt) {
+                    let v: Vec<f32> = store.bf16(bt)?.iter().map(|&x| bf16_to_f32(x)).collect();
+                    head_bt.insert(bt.clone(), v);
+                }
             }
         }
-        if in_c == 0 || in_c % 8 != 0 || in_h == 0 || in_w == 0 {
-            return Err(Error::Plan("no valid INPUT op".to_string()));
-        }
-        if embed_dim == 0 {
-            return Err(Error::Plan("no HEAD op".to_string()));
+        if !matches!(steps.last(), Some(Step::Head { .. })) {
+            return Err(Error::Plan("the bundle's last step is not a head".into()));
         }
         Ok(IrEmbedder {
             xrt: Xrt::open()?,
-            dir,
-            ops,
-            bcache: HashMap::new(),
-            fcache: HashMap::new(),
+            store,
+            steps,
+            head_bt,
+            model: m.param("model").ok().map(str::to_string),
             in_c,
             in_h,
             in_w,
-            embed_dim,
+            embed_dim: embed_dim.unwrap_or(0),
         })
     }
 
-    /// Stem input dims as recorded in the plan: (channels-padded-to-%8, h, w).
+    /// Stem input dims as recorded in the bundle: (channels-padded-to-%8, h, w).
     pub fn input_dims(&self) -> (usize, usize, usize) {
         (self.in_c, self.in_h, self.in_w)
     }
@@ -529,13 +766,21 @@ impl IrEmbedder {
         self.embed_dim
     }
 
-    /// NPU conv dispatches per forward (a fixed property of the plan).
+    /// The network the bundle holds (its `model` param, e.g. `IR-101`).
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// NPU conv dispatches per forward (a fixed property of the bundle).
     pub fn num_conv_dispatches(&self) -> usize {
-        self.ops.iter().filter(|(o, _)| o == "CONV").count()
+        self.steps
+            .iter()
+            .filter(|s| matches!(s, Step::Conv(_)))
+            .count()
     }
 
     /// Embed a caller-supplied image: channel-major (CHW) f32, spatial size
-    /// exactly the plan's h*w, 1..=in_c channels (an RGB face is 3; the
+    /// exactly the bundle's h*w, 1..=in_c channels (an RGB face is 3; the
     /// remaining stem channels are zero -- the recorded conv weights for them
     /// are zero too, so this is exact). For the AdaFace models the input is
     /// an aligned 112x112 face with cvlface preprocessing
@@ -552,7 +797,7 @@ impl IrEmbedder {
         let ch = chw.len() / plane;
         if ch > self.in_c {
             return Err(Error::Input(format!(
-                "{ch} channels, but the plan's stem takes at most {}",
+                "{ch} channels, but the bundle's stem takes at most {}",
                 self.in_c
             )));
         }
@@ -568,8 +813,8 @@ impl IrEmbedder {
         self.run(Some(&tiled))
     }
 
-    /// Embed the bundle's own recorded input (`input.bin`) -- a self-check
-    /// that must match `expected.bin` exactly, and the benchmark workload.
+    /// Embed the bundle's own recorded input (`ref.input`) -- a self-check
+    /// that must match `ref.npu_embedding` exactly, and the benchmark workload.
     pub fn embed_recorded(&mut self) -> Result<Vec<f32>, Error> {
         self.run(None)
     }
@@ -577,41 +822,41 @@ impl IrEmbedder {
     fn run(&mut self, input: Option<&[u16]>) -> Result<Vec<f32>, Error> {
         let Self {
             xrt,
-            dir,
-            ops,
-            bcache,
-            fcache,
+            store,
+            steps,
+            head_bt,
             ..
         } = self;
-        forward_ops(xrt, dir, ops, bcache, fcache, input)
+        forward(xrt, store, steps, head_bt, input)
     }
 }
 
-/// One forward pass over the parsed plan. NPU convs dispatch through the
+/// One forward pass over the parsed steps. NPU convs dispatch through the
 /// resident-context session `xrt`; the per-channel glue and residual add run
-/// on the host. Blobs are served from `bcache`/`fcache` (populated on the
-/// first pass), so repeated forwards touch the disk for nothing. `input`
-/// overrides the INPUT op's recorded file with a caller-built tiled buffer.
-fn forward_ops(
+/// on the host. `input` overrides the input step's recorded tensor with a
+/// caller-built tiled buffer. Every buffer a step reads exists (checked at
+/// load), so the `bufs[..]` lookups cannot fail.
+fn forward(
     xrt: &mut Xrt,
-    dir: &Path,
-    ops: &[Op],
-    bcache: &mut HashMap<String, Vec<u16>>,
-    fcache: &mut HashMap<String, Vec<f32>>,
+    store: &Store,
+    steps: &[Step],
+    head_bt: &HashMap<String, Vec<f32>>,
     input: Option<&[u16]>,
 ) -> Result<Vec<f32>, Error> {
     let mut bufs: HashMap<u32, Buf> = HashMap::new();
     let mut acc: HashMap<u32, Vec<f32>> = HashMap::new();
     let mut embed: Vec<f32> = Vec::new();
 
-    for (op, m) in ops {
-        match op.as_str() {
-            "INPUT" => {
-                let (c, h, w) = (
-                    geti(m, "c")? as usize,
-                    geti(m, "h")? as usize,
-                    geti(m, "w")? as usize,
-                );
+    for step in steps {
+        match step {
+            Step::Input {
+                buf,
+                c,
+                h,
+                w,
+                tensor,
+            } => {
+                let (c, h, w) = (*c, *h, *w);
                 let v = match input {
                     Some(t) => {
                         if t.len() != h * (c / 8) * w * 8 {
@@ -623,38 +868,25 @@ fn forward_ops(
                         }
                         t.to_vec()
                     }
-                    None => cache_bf16(bcache, dir, gets(m, "file")?)?.to_vec(),
+                    None => store.bf16(tensor)?.to_vec(),
                 };
-                bufs.insert(geti(m, "buf")? as u32, Buf { v, c, h, w });
+                bufs.insert(*buf, Buf { v, c, h, w });
             }
-            "CONV" => {
-                let in_id = geti(m, "in")? as u32;
-                let out_id = geti(m, "out")? as u32;
-                let c0 = geti(m, "c0")? as usize;
-                let icg = geti(m, "icg")? as usize;
-                let (oc, oh) = (geti(m, "oc")? as usize, geti(m, "oh")? as usize);
-                let (ow, owp) = (geti(m, "ow")? as usize, geti(m, "owp")? as usize);
-                let wp = geti(m, "wp")? as usize;
-                let key = gets(m, "xclbin")?;
-                xrt.ensure(
-                    key,
-                    &dir.join(key),
-                    &dir.join(gets(m, "insts")?),
-                    gets(m, "kernel")?,
-                )?;
-                let inp = slice_groups_wpad(getbuf(&bufs, in_id, "CONV")?, c0, icg / 8, wp);
-                let wt = cache_bf16(bcache, dir, gets(m, "wt")?)?;
-                let part = xrt.run(key, &inp, wt, oc * oh * owp)?;
+            Step::Conv(cv) => {
+                let (oc, oh, ow, owp) = (cv.oc, cv.oh, cv.ow, cv.owp);
+                xrt.ensure(&cv.ctx, &cv.xclbin, &cv.insts, &cv.kernel)?;
+                let inp = slice_groups_wpad(&bufs[&cv.input], cv.c0, cv.icg / 8, cv.wp);
+                let part = xrt.run(&cv.ctx, &inp, store.bf16(&cv.wt)?, oc * oh * owp)?;
                 let a = acc
-                    .entry(out_id)
+                    .entry(cv.out)
                     .or_insert_with(|| vec![0f32; oc * oh * owp]);
-                if geti(m, "first")? == 1 {
+                if cv.first {
                     a.iter_mut().for_each(|x| *x = 0.0);
                 }
                 for (dst, &p) in a.iter_mut().zip(&part) {
                     *dst += bf16_to_f32(p);
                 }
-                if geti(m, "last")? == 1 {
+                if cv.last {
                     // Crop the padded output width owp -> ow (tiled layout).
                     let mut v = vec![0u16; oh * (oc / 8) * ow * 8];
                     for y in 0..oh {
@@ -669,7 +901,7 @@ fn forward_ops(
                         }
                     }
                     bufs.insert(
-                        out_id,
+                        cv.out,
                         Buf {
                             v,
                             c: oc,
@@ -679,83 +911,47 @@ fn forward_ops(
                     );
                 }
             }
-            "AFFINE" => {
-                let in_id = geti(m, "in")? as u32;
-                let out_id = geti(m, "out")? as u32;
-                let scale = gets(m, "scale")?.to_string();
-                let shift = gets(m, "shift")?.to_string();
-                cache_bf16(bcache, dir, &scale)?;
-                cache_bf16(bcache, dir, &shift)?;
-                let r = affine_tiled(
-                    getbuf(&bufs, in_id, "AFFINE")?,
-                    &bcache[&scale],
-                    &bcache[&shift],
-                );
-                bufs.insert(out_id, r);
+            Step::Affine {
+                input,
+                out,
+                scale,
+                shift,
+            } => {
+                let r = affine_tiled(&bufs[input], store.bf16(scale)?, store.bf16(shift)?);
+                bufs.insert(*out, r);
             }
-            "PRELU_BIAS" => {
-                let id = geti(m, "buf")? as u32;
-                let alpha = cache_bf16(bcache, dir, gets(m, "alpha")?)?.to_vec();
-                let bias = cache_bf16(bcache, dir, gets(m, "bias")?)?.to_vec();
-                let buf = bufs
-                    .get_mut(&id)
-                    .ok_or_else(|| Error::Plan(format!("PRELU_BIAS: buffer {id} undefined")))?;
-                prelu_bias_tiled(buf, &alpha, &bias);
+            Step::PreluBias { buf, alpha, bias } => {
+                let buf = bufs.get_mut(buf).expect("checked at load");
+                prelu_bias_tiled(buf, store.bf16(alpha)?, store.bf16(bias)?);
             }
-            "BIAS" => {
-                let id = geti(m, "buf")? as u32;
-                let bias = cache_bf16(bcache, dir, gets(m, "bias")?)?.to_vec();
-                let buf = bufs
-                    .get_mut(&id)
-                    .ok_or_else(|| Error::Plan(format!("BIAS: buffer {id} undefined")))?;
-                bias_tiled(buf, &bias);
+            Step::Bias { buf, bias } => {
+                let buf = bufs.get_mut(buf).expect("checked at load");
+                bias_tiled(buf, store.bf16(bias)?);
             }
-            "SUBSAMPLE" => {
-                let (in_id, out_id) = (geti(m, "in")? as u32, geti(m, "out")? as u32);
-                let r = subsample_tiled(
-                    getbuf(&bufs, in_id, "SUBSAMPLE")?,
-                    geti(m, "stride")? as usize,
-                );
-                bufs.insert(out_id, r);
+            Step::Subsample { input, out, stride } => {
+                let r = subsample_tiled(&bufs[input], *stride);
+                bufs.insert(*out, r);
             }
-            "ADD" => {
-                let (a_id, b_id, out_id) = (
-                    geti(m, "a")? as u32,
-                    geti(m, "b")? as u32,
-                    geti(m, "out")? as u32,
-                );
-                let r = add_tiled(getbuf(&bufs, a_id, "ADD")?, getbuf(&bufs, b_id, "ADD")?);
-                bufs.insert(out_id, r);
+            Step::Add { a, b, out } => {
+                let r = add_tiled(&bufs[a], &bufs[b]);
+                bufs.insert(*out, r);
             }
-            "HEAD" => {
+            Step::Head {
+                input,
+                k,
+                n,
+                bt,
+                b2,
+            } => {
                 // Embedding head on the CPU: an exact f32 mat-vec with the
                 // folded head weights (both head BatchNorms folded into the
                 // Linear). M=1, so this is far cheaper than the padded M=32 NPU
                 // GEMM, and it keeps the head off the NPU so all 16 conv kernels
                 // stay resident (the NPU2 concurrent-context cap is 16).
-                let in_id = geti(m, "in")? as u32;
-                let (k, n) = (geti(m, "k")? as usize, geti(m, "n")? as usize);
-                let src = getbuf(&bufs, in_id, "HEAD")?;
-                if src.c * src.h * src.w != k {
-                    return Err(Error::Plan(format!(
-                        "HEAD input K mismatch: {} != {k}",
-                        src.c * src.h * src.w
-                    )));
-                }
-                let flat = tiled_to_nchw_f32(src); // [k]
-                let bt_name = gets(m, "bT")?.to_string();
-                let b2_name = gets(m, "b2")?.to_string();
-                // bT = W'' transposed [k, n], cached as f32 once.
-                if !fcache.contains_key(&bt_name) {
-                    let bf = read_bf16(&dir.join(&bt_name))?;
-                    fcache.insert(bt_name.clone(), bf.iter().map(|&x| bf16_to_f32(x)).collect());
-                }
-                if !fcache.contains_key(&b2_name) {
-                    let v = read_f32(&dir.join(&b2_name))?;
-                    fcache.insert(b2_name.clone(), v);
-                }
-                let bt = &fcache[&bt_name]; // [k * n], row-major [k][n]
-                let mut e = fcache[&b2_name].clone(); // [n], folded bias
+                let (k, n) = (*k, *n);
+                let flat = tiled_to_nchw_f32(&bufs[input]); // [k]
+                let bt = &head_bt[bt]; // [k * n], row-major [k][n]
+                let mut e = store.f32(b2)?.to_vec(); // [n], folded bias
                 for i in 0..k {
                     let f = flat[i];
                     let row = &bt[i * n..(i + 1) * n];
@@ -765,13 +961,7 @@ fn forward_ops(
                 }
                 embed = e;
             }
-            other => {
-                return Err(Error::Plan(format!("unknown op {other}")));
-            }
         }
-    }
-    if embed.is_empty() {
-        return Err(Error::Plan("plan produced no embedding (no HEAD op)".into()));
     }
     Ok(embed)
 }
@@ -781,11 +971,12 @@ fn forward_ops(
 // ----------------------------------------------------------------------------
 
 /// Full CLI entry point, shared by the per-network binaries (run_ir18,
-/// run_ir101). `net_name` only labels the output; the replayed plan is
-/// whatever the bundle contains. Prints per-forward latency (cold vs warm)
-/// and the embedding's cosine to the CPU reference (ref.bin) and the
-/// recorder's embedding (expected.bin); when the bundle has the raw f32 input
-/// (input_chw.bin), also exercises the public [`IrEmbedder::embed`] API and
+/// run_ir101). `net_name` labels the output when the bundle has no `model`
+/// param; the replayed network is whatever the bundle contains. Prints
+/// per-forward latency (cold vs warm) and the embedding's cosine to the CPU
+/// reference (`ref.cpu_embedding`) and the recorder's embedding
+/// (`ref.npu_embedding`); when the bundle has the raw f32 input
+/// (`ref.input_chw`), also exercises the public [`IrEmbedder::embed`] API and
 /// checks it reproduces the recorded replay.
 pub fn cli(net_name: &str) {
     let a: Vec<String> = std::env::args().collect();
@@ -832,7 +1023,8 @@ fn cli_run(net_name: &str, dir: &Path, reps: usize) -> Result<(), Error> {
     }
 
     println!(
-        "{net_name} forward: {} conv dispatches on the NPU + CPU head",
+        "{} forward: {} conv dispatches on the NPU + CPU head",
+        emb.model().unwrap_or(net_name),
         emb.num_conv_dispatches()
     );
     println!("embedding: {} dims", embed.len());
@@ -848,16 +1040,17 @@ fn cli_run(net_name: &str, dir: &Path, reps: usize) -> Result<(), Error> {
     }
 
     // Self-check against the recorder's own embedding (should be ~identical).
-    if let Ok(exp) = read_f32(&dir.join("expected.bin")) {
+    if let Ok(exp) = emb.store.f32("ref.npu_embedding") {
         println!(
             "cosine(Rust, recorder embedding)     = {:.5}",
-            cosine(&embed, &exp)
+            cosine(&embed, exp)
         );
     }
     // Exercise the public embed() API: feeding the raw f32 image through the
     // library's pad + bf16-round + tile path must reproduce the recorded
     // replay bit-for-bit (torch and the library both round to nearest even).
-    if let Ok(chw) = read_f32(&dir.join("input_chw.bin")) {
+    if let Ok(chw) = emb.store.f32("ref.input_chw") {
+        let chw = chw.to_vec();
         let e2 = emb.embed(&chw)?;
         println!(
             "cosine(embed() API, recorded replay) = {:.5}",
@@ -865,8 +1058,8 @@ fn cli_run(net_name: &str, dir: &Path, reps: usize) -> Result<(), Error> {
         );
     }
     // Ground-truth check against the CPU reference embedding.
-    if let Ok(r) = read_f32(&dir.join("ref.bin")) {
-        let cos = cosine(&embed, &r);
+    if let Ok(r) = emb.store.f32("ref.cpu_embedding") {
+        let cos = cosine(&embed, r);
         println!("cosine(Rust, CPU reference)          = {cos:.5}");
         println!(
             "{}",
