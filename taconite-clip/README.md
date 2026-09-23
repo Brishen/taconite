@@ -9,9 +9,9 @@ A zero-Python runtime for
 [`laion/CLIP-ViT-H-14-laion2B-s32B-b79K`](https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K):
 image and text embeddings and zero-shot classification, with both
 transformers on the AMD XDNA NPU (NPU2) through IRON kernels replayed with
-[`taconite`](../taconite). It is the forward of the Python app
-[`iron/applications/clip_vit_h14`](../../applications/clip_vit_h14), kernel
-for kernel.
+[`taconite`](https://crates.io/crates/taconite). It is the forward of
+[IRON](https://github.com/amd/IRON)'s Python app
+(`iron/applications/clip_vit_h14`), kernel for kernel.
 
 ```bash
 clip classify <bundle> cats.jpg car.png --label cat --label dog --label car
@@ -54,8 +54,8 @@ prompts a pass. The library is std-only; the CLI adds the `image` crate.
 
 ## Validation
 
-`clip check <bundle>` on NPU2 (`~/npu/clip/bundle`, two reference sets of 4
-images from the float32 model on the Radeon 890M via ROCm):
+`clip check <bundle>` on NPU2 (two reference sets of 4 images from the
+float32 model on the Radeon 890M via ROCm):
 
 ```
 tokenizer:
@@ -93,9 +93,9 @@ preprocess ~50, the patch embedding ~30). Loading the bundle takes 0.7 s
 # the bundle (in the NPU container, see the Python app)
 python -m iron.applications.clip_vit_h14.export_clip --out bundle --ref ref_coarse.npz --ref ref_fine.npz
 
-# the binary (native; XRT as for the other IRON Rust runtimes)
-cargo build --release
-./target/release/clip check bundle
+# the binary (links XRT; see the taconite crate)
+cargo install taconite-clip
+clip check bundle
 ```
 
 To run without XRT, build with `--no-default-features --features cli,direct`.

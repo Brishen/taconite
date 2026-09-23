@@ -3,14 +3,16 @@
 
 //! `gaic` — GAIC image cropping on the NPU, from an exported bundle.
 //!
-//!     gaic <bundle> check [--reps N] [--threads N]
-//!         Replays the bundle's reference image (the `ref.*` tensors) and
-//!         compares against what the exporter recorded: the resize against
-//!         PIL's, the feature map and the scores against the f32 CPU
-//!         reference and the Python NPU path.
-//!     gaic <bundle> crop [--out DIR] [--reps N] [--threads N] IMAGE...
-//!         GAIC-Pytorch's demo: the best crop overall and at 1:1, 4:3 and
-//!         16:9, printed in source-image pixels (and written to DIR).
+//! ```text
+//! gaic <bundle> check [--reps N] [--threads N]
+//!     Replays the bundle's reference image (the `ref.*` tensors) and
+//!     compares against what the exporter recorded: the resize against
+//!     PIL's, the feature map and the scores against the f32 CPU
+//!     reference and the Python NPU path.
+//! gaic <bundle> crop [--out DIR] [--reps N] [--threads N] IMAGE...
+//!     GAIC-Pytorch's demo: the best crop overall and at 1:1, 4:3 and
+//!     16:9, printed in source-image pixels (and written to DIR).
+//! ```
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

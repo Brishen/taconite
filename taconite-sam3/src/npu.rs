@@ -118,7 +118,7 @@ pub struct MhaIo {
 
 impl Npu {
     /// Opens the NPU and loads every kernel whose context fits; the rest
-    /// load on first use (see [`Npu::kernel`]).
+    /// load on first use (see `Npu::kernel`).
     pub fn open(m: &Manifest) -> Result<Self, Error> {
         let session = Session::open(0)?;
         let mut sources = HashMap::new();

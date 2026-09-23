@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # taconite-bundle
 
-Reads the bundles IRON's exporters write for its Rust runtimes. It is
-std-only and doesn't use XRT; `iron/common/bundle.py` is the writer side.
+Reads the bundles [IRON](https://github.com/amd/IRON)'s exporters write for
+its Rust runtimes. It is std-only and doesn't use XRT; IRON's
+`iron/common/bundle.py` is the writer side.
 
 ```text
 manifest.txt   one record a line: `<tag> <field>...`; `k=v` fields are also
@@ -46,9 +47,9 @@ loading is instant, a tensor's pages are read when it is first touched, and
 they stay reclaimable page cache, so a 2 GB bundle costs no heap. Don't
 rewrite a bundle's `tensors.bin` while a runtime has it loaded.
 
-Every IRON model with a Rust runtime reads its bundle through this crate:
-`iron/rust/taconite-sam3`, `iron/rust/taconite-adaface` (AdaFace IR-18 / IR-101),
-`iron/rust/taconite-clip`, `iron/rust/taconite-gaic`, `iron/applications/detr_resnet50/rust`,
-`iron/applications/all_minilm_l6_v2/rust`,
-`iron/applications/nli_minilm2_l6_h768/rust`, and, outside this repo,
-image-organizer's tagger (Taggerine, from a vendored copy).
+Every IRON model with a Rust runtime reads its bundle through this crate,
+among them [`taconite-sam3`](https://crates.io/crates/taconite-sam3),
+[`taconite-clip`](https://crates.io/crates/taconite-clip),
+[`taconite-gaic`](https://crates.io/crates/taconite-gaic) and
+[`taconite-adaface`](https://crates.io/crates/taconite-adaface) (AdaFace
+IR-18 / IR-101).

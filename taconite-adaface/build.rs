@@ -3,13 +3,18 @@
 
 // Compile the C++ XRT shim with g++/ar and link it plus libxrt_coreutil. No
 // build dependencies (no `cc` crate) so the crate builds offline. XRT lives at
-// $XRT_ROOT (default /opt/xilinx/xrt).
+// $XRT_ROOT (default /opt/xilinx/xrt). Nothing is built or linked on docs.rs
+// ($DOCS_RS), which has neither XRT nor its headers; rustdoc needs only the
+// Rust sources.
 
 use std::env;
 use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
     let xrt = env::var("XRT_ROOT").unwrap_or_else(|_| "/opt/xilinx/xrt".to_string());
     let out_dir = env::var("OUT_DIR").unwrap();
     let inc = format!("{xrt}/include");

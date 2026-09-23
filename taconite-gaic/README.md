@@ -5,42 +5,39 @@ SPDX-License-Identifier: Apache-2.0
 
 # `taconite-gaic` — GAIC image cropping on the NPU, from Rust
 
-Replays the bundle
-[`iron/applications/gaic/export_gaic.py`](../../applications/gaic/README.md)
-writes. The GAIC (VGG16) backbone and first FC layer run on the NPU, the glue
+Replays the bundle [IRON](https://github.com/amd/IRON)'s GAIC exporter
+(`iron/applications/gaic/export_gaic.py`) writes. The GAIC (VGG16) backbone and first FC layer run on the NPU, the glue
 runs on the host, and there is no Python, PyTorch or ONNX at run time. The
 library is std-only. The `gaic` binary adds image decoding and writing through
 the `image` crate (feature `cli`, on by default).
 
 The bundle uses the format every IRON bundle shares, read with
-[`taconite-bundle`](../taconite-bundle): `manifest.txt` (the kernels, the conv
+[`taconite-bundle`](https://crates.io/crates/taconite-bundle): `manifest.txt` (the kernels, the conv
 layer table and the head, parsed and cross-checked against the tensors at
 load), `tensors.txt` / `tensors.bin` (weights and the self-check's `ref.*`
 references), and `kernels/`. `export_gaic.py`'s docstring lists every record
 and tensor. Bundles in the older one-file-per-tensor format (`gaic 1`
 manifest) are rejected; re-export them.
 
-XRT is reached through [`taconite`](../taconite), vendored from
-image-organizer's `crates/iron`. It is a C shim over XRT's C++ API with a
-`Session` / `Kernel` / `Buffer` interface: hardware contexts stay resident,
-runs are cached per argument tuple, and there are sub-buffers and async
-launches.
+XRT is reached through [`taconite`](https://crates.io/crates/taconite), a C
+shim over XRT's C++ API with a `Session` / `Kernel` / `Buffer` interface:
+hardware contexts stay resident, runs are cached per argument tuple, and
+there are sub-buffers and async launches.
 
 ## Build and run
 
-The host needs XRT and `uuid/uuid.h`. On this NixOS setup, image-organizer's
-`shell.nix` provides both, and XRT is linked statically from `~/npu/xrt-static`
-when that tree exists (see `taconite/build.rs`).
+The host needs XRT and `uuid/uuid.h`; see
+[`taconite`](https://crates.io/crates/taconite) for how XRT is found and
+linked (dynamically from `$XRT_ROOT`, or statically from `$XRT_STATIC_ROOT`).
 
 ```bash
-cd iron/rust/taconite-gaic
-nix-shell ~/image-organizer/shell.nix --run "cargo build --release"
+cargo install taconite-gaic
 
 # Self-check against the bundle's reference image:
-./target/release/gaic ~/npu/gaic/bundle-v1 check --reps 5
+gaic bundle check --reps 5
 
 # GAIC-Pytorch's demo: best crop overall and at 1:1, 4:3, 16:9.
-./target/release/gaic ~/npu/gaic/bundle-v1 crop --out crops/ photo.jpg ...
+gaic bundle crop --out crops/ photo.jpg ...
 ```
 
 `check` compares against what the exporter recorded:

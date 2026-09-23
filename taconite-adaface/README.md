@@ -9,18 +9,24 @@ An **embeddable** Rust library, with no crates.io dependencies, that runs
 AdaFace IR face embedders (IR-18, IR-101) on the AIE NPU with no Python at
 inference time. It replays a *bundle* — compiled conv kernels, packed
 weights, and the network's steps in order, in the format every IRON bundle
-shares (read with the in-repo, std-only `iron/rust/taconite-bundle`) — exported
-ahead of time by
+shares (read with the std-only
+[`taconite-bundle`](https://crates.io/crates/taconite-bundle)) — exported
+ahead of time by [IRON](https://github.com/amd/IRON)'s
 `iron/applications/adaface_ir18/export_ir18.py` /
 `iron/applications/adaface_ir101/export_ir101.py` (iron acts purely as an
-AOT compiler). The `run_ir18` / `run_ir101` binaries under the app
-directories are thin CLI wrappers over this crate.
+AOT compiler). IRON's `run_ir18` / `run_ir101` binaries are thin CLI
+wrappers over this crate.
+
+Prebuilt NPU2 bundles are on Hugging Face:
+[`brishen/iron-adaface-ir18-npu2`](https://huggingface.co/brishen/iron-adaface-ir18-npu2)
+and
+[`brishen/iron-adaface-ir101-npu2`](https://huggingface.co/brishen/iron-adaface-ir101-npu2).
 
 ## Using it from another Rust app
 
 ```toml
 [dependencies]
-taconite-adaface = { path = ".../iron/rust/taconite-adaface" }  # or a git dep
+taconite-adaface = "0.1"
 ```
 
 ```rust
@@ -70,8 +76,8 @@ close; `TACONITE_CTX_CACHE` overrides the resident-context cap (default 16).
 - **XRT** headers/libs at `$XRT_ROOT` (default `/opt/xilinx/xrt`) and `g++`
   at build time: this crate's `build.rs` compiles the bundled C++ shim
   (`iron_xrt_shim.cpp`, one `xrt::hw_context` LRU) and links
-  `libxrt_coreutil`. No crates.io dependencies (only the in-repo
-  `taconite-bundle`), so it builds offline.
+  `libxrt_coreutil`. Its only dependency is the std-only
+  `taconite-bundle`, and it needs no build dependencies.
 - At link time the flags propagate to your binary automatically. The
   **rpath does not** (cargo drops `rustc-link-arg` across crates): either
   run with XRT's `setup.sh` sourced (`LD_LIBRARY_PATH`), or emit the rpaths
@@ -114,8 +120,8 @@ myapp/
   bundle/...
 ```
 
-`package_portable.sh <binary> <outdir> [bundle_dir]` (in this directory)
-assembles it from an installed XRT (`$XRT_ROOT`, default `/opt/xilinx/xrt`).
+`package_portable.sh <binary> <outdir> [bundle_dir]` (shipped in this
+crate's source) assembles it from an installed XRT (`$XRT_ROOT`, default `/opt/xilinx/xrt`).
 The `lib/` **subdirectory** is load-bearing — XRT strips the lib component
 from coreutil's location to find its root, so the `.so` files must not sit
 beside the binary.
@@ -149,5 +155,5 @@ through the public `embed()` API — its pad + round + tile path reproduces
 the recorded replay bit-for-bit (verified cosine 1.00000 on NPU2 for both
 IR-18 and IR-101; cosine vs the fp32 reference is 0.9993 / 0.9974).
 
-See `iron/applications/adaface_ir18/README.md` for how the network maps onto
-NPU kernels and why the glue/head run on the CPU.
+IRON's `iron/applications/adaface_ir18/README.md` describes how the network
+maps onto NPU kernels and why the glue/head run on the CPU.

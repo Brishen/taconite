@@ -55,7 +55,7 @@ pub struct ConvSpec {
     pub p: usize,
     /// The stem: A is a materialised im2col, P windows of 9C a row.
     pub window: bool,
-    /// Y's row width (view) / one pixel's [dy][c] run (window, = 3C).
+    /// Y's row width (view) / one pixel's `[dy][c]` run (window, = 3C).
     pub d: usize,
     /// Tensor: the packed B.
     pub b: String,

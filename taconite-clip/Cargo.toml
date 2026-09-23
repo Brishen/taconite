@@ -5,7 +5,12 @@
 name = "taconite-clip"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "CLIP ViT-H/14 image and text embeddings / zero-shot classification on an AMD XDNA NPU: IRON kernels replayed through XRT, no Python"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["npu", "xdna", "clip", "embeddings", "amd"]
+categories = ["computer-vision", "science", "command-line-utilities"]
 
 [features]
 default = ["cli", "xrt"]
@@ -21,15 +26,20 @@ xrt = ["taconite/xrt", "taconite-sam3/xrt"]
 direct = ["taconite-sam3/direct"]
 
 [dependencies]
-taconite-bundle = { path = "../taconite-bundle" }
-taconite = { path = "../taconite", default-features = false }
+taconite-bundle = { version = "0.1.0", path = "../taconite-bundle" }
+taconite = { version = "0.1.0", path = "../taconite", default-features = false }
 # the CLIP BPE tokenizer and the threaded host-math helpers
-taconite-sam3 = { path = "../taconite-sam3", default-features = false }
+taconite-sam3 = { version = "0.1.0", path = "../taconite-sam3", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 
 [[bin]]
 name = "clip"
 required-features = ["cli"]
+
+# docs.rs has no XRT; taconite's build.rs skips the shim there.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
 
 [profile.release]
 debug = 1

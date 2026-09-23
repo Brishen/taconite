@@ -9,9 +9,13 @@ A zero-Python runtime for [SAM 3](https://huggingface.co/facebook/sam3):
 give it an image and a text prompt ("cat", "person", "laptop") and it
 returns every matching instance's score, box and mask. The heavy image
 side runs on the AMD XDNA NPU (NPU2) through IRON kernels replayed with
-[`taconite`](../taconite); everything else runs here in plain `std` Rust.
-It is the forward of the Python app
-[`iron/applications/sam3`](../../applications/sam3), stage for stage.
+[`taconite`](https://crates.io/crates/taconite); everything else runs here
+in plain `std` Rust. It is the forward of [IRON](https://github.com/amd/IRON)'s
+Python app (`iron/applications/sam3`), stage for stage.
+
+A prebuilt NPU2 bundle is on Hugging Face:
+[`brishen/iron-sam3-npu2`](https://huggingface.co/brishen/iron-sam3-npu2)
+(`hf download brishen/iron-sam3-npu2 --local-dir sam3`).
 
 ```bash
 sam3 segment <bundle> photo.jpg "person" -o overlay.png
@@ -105,13 +109,15 @@ Host buffers of the NPU are touched only through bulk parallel copies
 python -m iron.applications.sam3.export_sam3 --out bundle --model /path/to/sam3 \
     --image cats.jpg --prompt cat --case cats.jpg:cat:ref_cats.npz ...
 
-# 2. The runtime (links XRT; see ../taconite)
-cargo build --release
+# 2. The runtime (links XRT; see the taconite crate)
+cargo install taconite-sam3
 
 # 3. Run
-./target/release/sam3 check bundle
-./target/release/sam3 segment bundle photo.jpg "red car" -o overlay.png [--threshold 0.5] [--reps 3] [--threads 16]
+sam3 check bundle
+sam3 segment bundle photo.jpg "red car" -o overlay.png [--threshold 0.5] [--reps 3] [--threads 16]
 ```
+
+Step 1 is IRON's exporter; the prebuilt bundle above replaces it.
 
 The bundle is ~1.5 GB: the NPU weights pre-packed (bfp16), the text
 encoder's in bf16, everything else f32, plus the reference tensors.

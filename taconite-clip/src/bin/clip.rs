@@ -3,9 +3,11 @@
 
 //! `clip`: CLIP ViT-H/14 on the NPU from the command line.
 //!
-//!   clip classify <bundle> <image>... --label <name>... [--reps N]
-//!   clip embed <bundle> [--image <file>]... [--text <prompt>]... -o <out.f32>
-//!   clip check <bundle>
+//! ```text
+//! clip classify <bundle> <image>... --label <name>... [--reps N]
+//! clip embed <bundle> [--image <file>]... [--text <prompt>]... -o <out.f32>
+//! clip check <bundle>
+//! ```
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
