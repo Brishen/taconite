@@ -34,7 +34,12 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use iron_xrt::{Buffer, Kernel, Session, bf16_to_f32, f32_to_bf16};
+use iron_xrt::{bf16_to_f32, f32_to_bf16};
+// The NPU path: XRT, or the driver's ioctls with no XRT (feature `direct`).
+#[cfg(feature = "direct")]
+use iron_xrt::direct::{Buffer, Kernel, Run, Session};
+#[cfg(not(feature = "direct"))]
+use iron_xrt::{Buffer, Kernel, Run, Session};
 
 use par::par_rows;
 
@@ -347,7 +352,7 @@ impl Gaic {
             let lp = &plan.layers[i];
             let layer = &self.layers[i];
             let kernel = &self.kernels[&layer.spec.kernel];
-            let mut runs: VecDeque<(iron_xrt::Run, &Buffer)> = VecDeque::new();
+            let mut runs: VecDeque<(Run, &Buffer)> = VecDeque::new();
             for (a, c) in &lp.chunks {
                 if runs.len() == IN_FLIGHT {
                     let (r, c) = runs.pop_front().unwrap();

@@ -82,10 +82,10 @@ fn run_direct(
     a: &[u16],
     b: &[u16],
 ) -> Result<(Vec<u16>, Vec<Duration>), Box<dyn std::error::Error>> {
-    use iron_xrt::direct::Device;
+    use iron_xrt::direct::Session;
     let n = a.len();
     let t = Instant::now();
-    let device = Device::open()?;
+    let device = Session::open(0)?;
     let opened = t.elapsed();
     let (cols, rows) = device.array();
     println!(
@@ -95,7 +95,7 @@ fn run_direct(
         device.power_mode()?
     );
     let t = Instant::now();
-    let kernel = device.load_kernel(xclbin, insts, n as u64)?;
+    let kernel = device.load_kernel(xclbin, insts, None, n as u64)?;
     let loaded = t.elapsed();
     let t = Instant::now();
     let (mut ab, mut bb, cb) = (device.alloc_of::<u16>(n)?, device.alloc_of::<u16>(n)?, device.alloc_of::<u16>(n)?);

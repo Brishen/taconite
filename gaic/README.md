@@ -52,6 +52,10 @@ feature map 32x16x24: cosine vs CPU 0.999984, vs Python NPU 1.000000
 CHECK OK
 ```
 
+To run without XRT, build with `--features direct`. The kernels then go
+through the `amdxdna` driver's ioctls (`iron_xrt::direct`). `check` gives the
+same numbers, and `crop` the same boxes and scores.
+
 - **Resize.** The input resize reproduces Pillow's LANCZOS bit for bit.
 - **Feature map.** It is identical to the Python NPU path (cosine 1.000000).
 - **Crop.** The chosen crop matches the f32 CPU reference.

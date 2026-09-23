@@ -17,17 +17,18 @@
 //! - per run: the command packet written into the command BO, one
 //!   `EXEC_CMD`, one `SYNCOBJ_TIMELINE_WAIT` on the context's fence.
 //!
-//! [`Device`] / [`Kernel`] / [`Buffer`] do that sequence. Argument buffers
-//! are shared-memory BOs the NPU reaches by their *host* virtual address
-//! (shared virtual addressing through the IOMMU), so they are filled in
-//! place like [`crate::Buffer`]s, with the CPU caches flushed around a run.
-//! The command packet is IRON's `MLIR_AIE` kernel ABI, the one every
-//! design aiecc builds has: `opcode, instr, ninstr, bo0…bo4` at fixed
-//! offsets (aiecc's `kernels.json`).
+//! [`Session`] / [`Kernel`] / [`Buffer`] / [`Run`] do that sequence with
+//! the methods of the crate's XRT types (sub-buffers, `start`/`wait`,
+//! kernels of one xclbin sharing a context), so a model switches paths by
+//! its `use` line. Argument buffers are shared-memory BOs the NPU reaches
+//! by their *host* virtual address (shared virtual addressing through the
+//! IOMMU), so they are filled in place like [`crate::Buffer`]s, with the
+//! CPU caches flushed around a run. The command packet is IRON's
+//! `MLIR_AIE` kernel ABI, the one every design aiecc builds has: `opcode,
+//! instr, ninstr, bo0…bo4` at fixed offsets (aiecc's `kernels.json`).
 //!
-//! Not covered: sub-buffers, launching without waiting, xclbins holding
-//! more than one PDI. The layouts follow the kernel's
-//! `include/uapi/drm/amdxdna_accel.h` (Linux 7.1) and XRT's
+//! Not covered: xclbins holding more than one PDI. The layouts follow the
+//! kernel's `include/uapi/drm/amdxdna_accel.h` (Linux 7.1) and XRT's
 //! `xrt/detail/xclbin.h`.
 //!
 //! Adapted from RLX's `rlx-xdna/src/direct.rs`
@@ -40,6 +41,8 @@
 //! `ETIME` at once with the command still `NEW`. That is exactly what this
 //! module does on an NPU2 given the same timeout (see [`Kernel::run`]).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -47,7 +50,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::Error;
@@ -426,6 +429,8 @@ struct DeviceInner {
     meta: sys::AieMetadata,
     /// The device heap: handle, host mapping, device address.
     heap: (u32, *mut u8, u64),
+    /// The live hardware contexts, by xclbin and kernel name.
+    contexts: Mutex<HashMap<String, Weak<Context>>>,
 }
 
 const HEAP_SIZE: usize = 64 << 20;
@@ -528,23 +533,24 @@ pub struct ContextInfo {
 }
 
 /// The NPU, opened through its DRM accel node, with the process's device
-/// heap mapped. Kernels and buffers hold a reference to it.
+/// heap mapped: this module's [`crate::Session`]. Kernels and buffers hold
+/// a reference to it.
 #[derive(Clone)]
-pub struct Device {
+pub struct Session {
     inner: Arc<DeviceInner>,
     _not_sync: PhantomData<*const ()>,
 }
 
 // SAFETY: as for crate::Session — the fd and mappings may move between
 // threads; `!Sync` keeps their use one thread at a time.
-unsafe impl Send for Device {}
+unsafe impl Send for Session {}
 unsafe impl Send for Kernel {}
 unsafe impl Send for Buffer {}
 
-impl Device {
-    /// Opens [`crate::DEVICE_NODE`].
-    pub fn open() -> Result<Self, Error> {
-        Self::open_path(Path::new(crate::DEVICE_NODE))
+impl Session {
+    /// Opens `/dev/accel/accel<device_index>` (0 on a laptop).
+    pub fn open(device_index: u32) -> Result<Self, Error> {
+        Self::open_path(Path::new(&format!("/dev/accel/accel{device_index}")))
     }
 
     /// Opens the accel node at `path` and sets up the device heap.
@@ -554,7 +560,12 @@ impl Device {
             .write(true)
             .open(path)
             .map_err(|e| Error::Device(format!("{}: {e}", path.display())))?;
-        let mut inner = DeviceInner { file, meta: Default::default(), heap: (0, std::ptr::null_mut(), 0) };
+        let mut inner = DeviceInner {
+            file,
+            meta: Default::default(),
+            heap: (0, std::ptr::null_mut(), 0),
+            contexts: Mutex::new(HashMap::new()),
+        };
 
         // XRT's order: the heap, a query, then (per kernel) the context.
         let (handle, map_offset, xdna_addr) =
@@ -646,19 +657,55 @@ impl Device {
             .collect())
     }
 
-    /// Loads an xclbin + instruction stream into a hardware context of its
-    /// own. `ops_per_run` is declared to the driver as the context's QoS
-    /// `gops`, as [`crate::Session::load_kernel`] does.
-    pub fn load_kernel(&self, xclbin: &Path, insts: &Path, ops_per_run: u64) -> Result<Kernel, Error> {
+    /// Loads an xclbin + instruction stream, as [`crate::Session::load_kernel`]
+    /// does: kernels naming the same xclbin (and kernel name) share one
+    /// hardware context, resident until the last of them is dropped. The
+    /// context runs the xclbin's one PDI whatever `kernel_name` says; the
+    /// name only tells contexts apart. `ops_per_run` is declared to the
+    /// driver as the context's QoS `gops`.
+    pub fn load_kernel(
+        &self,
+        xclbin: &Path,
+        insts: &Path,
+        kernel_name: Option<&str>,
+        ops_per_run: u64,
+    ) -> Result<Kernel, Error> {
+        let insts = std::fs::read(insts).map_err(|e| Error::Kernel(format!("{}: {e}", insts.display())))?;
+        let key = format!("{}\n{}", xclbin.display(), kernel_name.unwrap_or(""));
+        let ctx = {
+            let mut contexts = self.inner.contexts.lock().unwrap();
+            match contexts.get(&key).and_then(Weak::upgrade) {
+                Some(ctx) => ctx,
+                None => {
+                    let ctx = Arc::new(self.create_context(xclbin, ops_per_run)?);
+                    contexts.retain(|_, c| c.strong_count() > 0);
+                    contexts.insert(key, Arc::downgrade(&ctx));
+                    ctx
+                }
+            }
+        };
+        let instr = self
+            .device_bo(&insts)
+            .map_err(|e| Error::Kernel(format!("{}: instruction buffer: {e}", xclbin.display())))?;
+        Ok(Kernel {
+            ctx,
+            instr,
+            ninstr_bytes: insts.len() as u32,
+            idle: RefCell::new(Vec::new()),
+            _not_sync: PhantomData,
+        })
+    }
+
+    /// `CREATE_HWCTX` sized to the xclbin's partition, with its PDI bound as
+    /// the compute unit.
+    fn create_context(&self, xclbin: &Path, ops_per_run: u64) -> Result<Context, Error> {
         let kerr = |what: &str| {
             let what = format!("{}: {what}", xclbin.display());
             move |e: io::Error| Error::Kernel(format!("{what}: {e}"))
         };
         let bytes = std::fs::read(xclbin).map_err(kerr("reading"))?;
         let part = axlf::partition(&bytes).map_err(kerr("parsing"))?;
-        let insts = std::fs::read(insts).map_err(|e| Error::Kernel(format!("{}: {e}", insts.display())))?;
         let dev = &self.inner;
-
         let qos = sys::QosInfo {
             gops: u32::try_from((ops_per_run as f64 / 1e9).round() as u64).unwrap_or(u32::MAX),
             ..Default::default()
@@ -671,36 +718,20 @@ impl Device {
             ..Default::default()
         };
         sys::drm(dev.fd(), sys::CREATE_HWCTX, &mut c).map_err(kerr("CREATE_HWCTX"))?;
-        let mut kernel = Kernel {
-            dev: dev.clone(),
-            hwctx: c.handle,
-            syncobj: c.syncobj_handle,
-            pdi: None,
-            instr: None,
-            cmd: None,
-            ninstr_bytes: insts.len() as u32,
-            _not_sync: PhantomData,
-        };
+        let mut ctx = Context { dev: dev.clone(), handle: c.handle, syncobj: c.syncobj_handle, _pdi: None };
 
-        // The PDI into a device BO, bound as the context's compute unit.
         let pdi = self.device_bo(&part.pdi).map_err(kerr("PDI buffer"))?;
         let mut cu = sys::ConfigCu { num_cus: 1, cu_bo: pdi.handle, ..Default::default() };
         let mut cfg = sys::ConfigHwctx {
-            handle: kernel.hwctx,
+            handle: ctx.handle,
             param_type: 0, // DRM_AMDXDNA_HWCTX_CONFIG_CU
             param_val: &mut cu as *mut sys::ConfigCu as u64,
             param_val_size: std::mem::size_of::<sys::ConfigCu>() as u32,
             pad: 0,
         };
-        kernel.pdi = Some(pdi);
+        ctx._pdi = Some(pdi);
         sys::drm(dev.fd(), sys::CONFIG_HWCTX, &mut cfg).map_err(kerr("CONFIG_HWCTX(CU)"))?;
-
-        kernel.instr = Some(self.device_bo(&insts).map_err(kerr("instruction buffer"))?);
-        let (handle, map_offset, _) = dev.create_bo(sys::BO_CMD, CMD_BYTES).map_err(kerr("CREATE_BO(CMD)"))?;
-        let ptr = dev.mmap(map_offset, CMD_BYTES);
-        let ptr = ptr.inspect_err(|_| dev.gem_close(handle)).map_err(kerr("mapping the command buffer"))?;
-        kernel.cmd = Some(Bo { dev: dev.clone(), handle, ptr, size: CMD_BYTES, xdna_addr: u64::MAX });
-        Ok(kernel)
+        Ok(ctx)
     }
 
     /// A device BO (carved from the heap) holding `data`.
@@ -714,7 +745,8 @@ impl Device {
         Ok(Bo { dev: dev.clone(), handle, ptr: std::ptr::null_mut(), size: data.len(), xdna_addr })
     }
 
-    /// A zeroed buffer of `bytes` bytes the NPU and the host share.
+    /// A zeroed buffer of `bytes` bytes the NPU and the host share, usable
+    /// as an argument of any kernel of this session.
     pub fn alloc(&self, bytes: usize) -> Result<Buffer, Error> {
         let dev = &self.inner;
         let berr = |what: &'static str| move |e: io::Error| Error::Buffer(format!("{what} ({bytes} bytes): {e}"));
@@ -723,13 +755,21 @@ impl Device {
         // SAFETY: a fresh `bytes`-byte mapping.
         unsafe { std::ptr::write_bytes(ptr, 0, bytes) };
         flush(ptr, bytes);
-        Ok(Buffer { bo: Bo { dev: dev.clone(), handle, ptr, size: bytes, xdna_addr }, _not_sync: PhantomData })
+        let bo = Arc::new(Bo { dev: dev.clone(), handle, ptr, size: bytes, xdna_addr });
+        Ok(Buffer { bo, offset: 0, bytes, _not_sync: PhantomData })
     }
 
     /// [`alloc`](Self::alloc) sized for `n` elements of `T`.
     pub fn alloc_of<T: Copy>(&self, n: usize) -> Result<Buffer, Error> {
         self.alloc(n * std::mem::size_of::<T>())
     }
+}
+
+/// A command BO, mapped.
+fn command_bo(dev: &Arc<DeviceInner>) -> io::Result<Bo> {
+    let (handle, map_offset, _) = dev.create_bo(sys::BO_CMD, CMD_BYTES)?;
+    let ptr = dev.mmap(map_offset, CMD_BYTES).inspect_err(|_| dev.gem_close(handle))?;
+    Ok(Bo { dev: dev.clone(), handle, ptr, size: CMD_BYTES, xdna_addr: u64::MAX })
 }
 
 /// Maps `size` bytes of the BO at `map_offset` at a host address aligned to
@@ -792,48 +832,71 @@ pub const MAX_ARGS: usize = 5;
 /// How long a run may take before it is reported as hung.
 const RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A kernel on a hardware context of its own, released on drop.
-pub struct Kernel {
+/// A hardware context: an xclbin's partition, configured with its PDI.
+/// Destroyed when the last kernel on it is dropped.
+struct Context {
     dev: Arc<DeviceInner>,
-    hwctx: u32,
+    handle: u32,
     syncobj: u32,
-    pdi: Option<Bo>,
-    instr: Option<Bo>,
-    cmd: Option<Bo>,
-    ninstr_bytes: u32,
-    _not_sync: PhantomData<*const ()>,
+    /// Dropped after the context is destroyed (fields drop after `drop`).
+    _pdi: Option<Bo>,
 }
 
-impl Drop for Kernel {
+impl Drop for Context {
     fn drop(&mut self) {
-        // The context first: it holds the PDI and runs the instructions.
-        let _ = sys::drm(self.dev.fd(), sys::DESTROY_HWCTX, &mut sys::HandlePad { handle: self.hwctx, pad: 0 });
-        self.cmd.take();
-        self.instr.take();
-        self.pdi.take();
+        let _ = sys::drm(self.dev.fd(), sys::DESTROY_HWCTX, &mut sys::HandlePad { handle: self.handle, pad: 0 });
     }
 }
 
+/// A kernel: an instruction stream on a (possibly shared) hardware context.
+pub struct Kernel {
+    ctx: Arc<Context>,
+    instr: Bo,
+    ninstr_bytes: u32,
+    /// Command BOs of finished runs, for the next ones: a run in flight
+    /// owns its own, so several may be.
+    idle: RefCell<Vec<Bo>>,
+    _not_sync: PhantomData<*const ()>,
+}
+
 impl Kernel {
-    /// Runs the kernel over `args` (its buffer arguments in order, at most
-    /// [`MAX_ARGS`]) and waits for it; returns the time from submission to
-    /// completion. Inputs must have been [`sync_to_device`](Buffer::sync_to_device)d,
-    /// outputs need [`sync_from_device`](Buffer::sync_from_device) before reading.
+    /// Launches the kernel over `args` (its buffer arguments in order, at
+    /// most [`MAX_ARGS`]) and waits for it; returns the time from
+    /// submission to completion. Inputs must have been
+    /// [`sync_to_device`](Buffer::sync_to_device)d, outputs need
+    /// [`sync_from_device`](Buffer::sync_from_device) before reading.
     pub fn run(&self, args: &[&Buffer]) -> Result<Duration, Error> {
+        self.start(args)?.wait()
+    }
+
+    /// Launches without waiting. The returned [`Run`] borrows the argument
+    /// buffers until [`Run::wait`], as [`crate::Kernel::start`]'s does.
+    pub fn start<'a>(&'a self, args: &[&'a Buffer]) -> Result<Run<'a>, Error> {
         if args.len() > MAX_ARGS {
             return Err(Error::Run(format!("{} buffer arguments; the kernel takes at most {MAX_ARGS}", args.len())));
         }
-        let (cmd, instr) = (self.cmd.as_ref().unwrap(), self.instr.as_ref().unwrap());
-        let packet = packet(instr.xdna_addr, self.ninstr_bytes, args.iter().map(|b| b.bo.ptr as u64));
+        let dev = &self.ctx.dev;
+        let idle = self.idle.borrow_mut().pop();
+        let cmd = match idle {
+            Some(cmd) => cmd,
+            None => command_bo(dev).map_err(|e| Error::Run(format!("command buffer: {e}")))?,
+        };
+        let packet = packet(self.instr.xdna_addr, self.ninstr_bytes, args.iter().map(|b| b.addr()));
         // SAFETY: the command BO is CMD_BYTES long and mapped; the packet is
         // far shorter.
         unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr().cast::<u8>(), cmd.ptr, packet.len() * 4) };
         flush(cmd.ptr, packet.len() * 4);
 
-        // The BOs the command references, for the driver to pin.
-        let handles: Vec<u32> = std::iter::once(instr.handle).chain(args.iter().map(|b| b.bo.handle)).collect();
+        // The BOs the command references, for the driver to pin (a
+        // sub-buffer's is its parent's), once each.
+        let mut handles = vec![self.instr.handle];
+        for b in args {
+            if !handles.contains(&b.bo.handle) {
+                handles.push(b.bo.handle);
+            }
+        }
         let mut exec = sys::ExecCmd {
-            hwctx: self.hwctx,
+            hwctx: self.ctx.handle,
             ty: 0, // AMDXDNA_CMD_SUBMIT_EXEC_BUF
             cmd_handles: cmd.handle as u64,
             args: handles.as_ptr() as u64,
@@ -842,38 +905,85 @@ impl Kernel {
             ..Default::default()
         };
         let start = Instant::now();
-        sys::drm(self.dev.fd(), sys::EXEC_CMD, &mut exec).map_err(|e| Error::Run(format!("EXEC_CMD: {e}")))?;
-        let signaled = self.wait(exec.seq).map_err(|e| Error::Run(format!("SYNCOBJ_TIMELINE_WAIT: {e}")))?;
-        let elapsed = start.elapsed();
-
-        // The firmware writes the command's state into the packet header.
-        flush(cmd.ptr, 4);
-        // SAFETY: the first word of the mapped command BO.
-        let state = unsafe { std::ptr::read_volatile(cmd.ptr as *const u32) } & 0xf;
-        if !signaled || state != ERT_COMPLETED {
-            let why = if signaled { "finished" } else { "did not finish within 10 s" };
-            return Err(Error::Run(format!("the command {why}, in state {}", ert_state(state))));
+        if let Err(e) = sys::drm(dev.fd(), sys::EXEC_CMD, &mut exec) {
+            self.idle.borrow_mut().push(cmd);
+            return Err(Error::Run(format!("EXEC_CMD: {e}")));
         }
-        Ok(elapsed)
+        Ok(Run { kernel: self, cmd: Some(cmd), seq: exec.seq, start, _borrow: PhantomData })
     }
 
+    /// Waits for fence point `seq` of the context, up to [`RUN_TIMEOUT`].
     fn wait(&self, seq: u64) -> io::Result<bool> {
-        let (handle, point) = (self.syncobj, seq);
+        let (handle, point) = (self.ctx.syncobj, seq);
         // An absolute CLOCK_MONOTONIC deadline: a relative one is already in
         // the past, and the wait gives up before the NPU has started.
-        let now = monotonic_ns();
         let mut w = sys::SyncobjTimelineWait {
             handles: &handle as *const u32 as u64,
             points: &point as *const u64 as u64,
-            timeout_nsec: now + RUN_TIMEOUT.as_nanos() as i64,
+            timeout_nsec: monotonic_ns() + RUN_TIMEOUT.as_nanos() as i64,
             count_handles: 1,
             ..Default::default()
         };
-        match sys::drm(self.dev.fd(), sys::SYNCOBJ_TIMELINE_WAIT, &mut w) {
+        match sys::drm(self.ctx.dev.fd(), sys::SYNCOBJ_TIMELINE_WAIT, &mut w) {
             Ok(()) => Ok(true),
             Err(e) if e.raw_os_error() == Some(sys::ETIME) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// An in-flight kernel launch; dropped without [`wait`](Self::wait), it
+/// waits anyway (the array must not outlive the borrows).
+pub struct Run<'a> {
+    kernel: &'a Kernel,
+    cmd: Option<Bo>,
+    seq: u64,
+    start: Instant,
+    _borrow: PhantomData<&'a Buffer>,
+}
+
+impl Run<'_> {
+    /// Blocks until the launch completes; returns its submission-to-completion time.
+    pub fn wait(mut self) -> Result<Duration, Error> {
+        self.wait_inner()
+    }
+
+    fn wait_inner(&mut self) -> Result<Duration, Error> {
+        let Some(cmd) = self.cmd.take() else {
+            return Ok(Duration::ZERO);
+        };
+        let signaled = self.kernel.wait(self.seq);
+        let elapsed = self.start.elapsed();
+        // The firmware writes the command's state into the packet header.
+        flush(cmd.ptr, 4);
+        // SAFETY: the first word of the mapped command BO.
+        let state = unsafe { std::ptr::read_volatile(cmd.ptr as *const u32) } & 0xf;
+        match signaled {
+            Ok(true) => {
+                self.kernel.idle.borrow_mut().push(cmd);
+                if state == ERT_COMPLETED {
+                    Ok(elapsed)
+                } else {
+                    Err(Error::Run(format!("the command finished in state {}", ert_state(state))))
+                }
+            }
+            // The firmware may still hold the command: never reuse or free
+            // its BO under it.
+            Ok(false) => {
+                std::mem::forget(cmd);
+                Err(Error::Run(format!("the command did not finish within 10 s, in state {}", ert_state(state))))
+            }
+            Err(e) => {
+                std::mem::forget(cmd);
+                Err(Error::Run(format!("SYNCOBJ_TIMELINE_WAIT: {e}")))
+            }
+        }
+    }
+}
+
+impl Drop for Run<'_> {
+    fn drop(&mut self) {
+        let _ = self.wait_inner();
     }
 }
 
@@ -931,43 +1041,82 @@ fn ert_state(state: u32) -> String {
     format!("{state} ({name})")
 }
 
-/// A buffer the host and the NPU share, filled and read in place.
+/// A buffer the host and the NPU share, filled and read in place — or a
+/// view of part of one ([`sub`](Self::sub)).
 pub struct Buffer {
-    bo: Bo,
+    bo: Arc<Bo>,
+    offset: usize,
+    bytes: usize,
     _not_sync: PhantomData<*const ()>,
 }
 
 impl fmt::Debug for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Buffer").field("handle", &self.bo.handle).field("bytes", &self.bo.size).finish()
+        f.debug_struct("Buffer")
+            .field("handle", &self.bo.handle)
+            .field("offset", &self.offset)
+            .field("bytes", &self.bytes)
+            .finish()
     }
 }
 
 impl Buffer {
     pub fn len_bytes(&self) -> usize {
-        self.bo.size
+        self.bytes
+    }
+
+    /// Where the NPU finds it: its host address (shared virtual addressing).
+    fn addr(&self) -> u64 {
+        self.bo.ptr as u64 + self.offset as u64
+    }
+
+    fn host(&self) -> *mut u8 {
+        // SAFETY: offset is within the mapping (checked by `sub`).
+        unsafe { self.bo.ptr.add(self.offset) }
+    }
+
+    /// A view of `bytes` bytes of this buffer from `offset`, a [`Buffer`] in
+    /// its own right: a kernel argument (the NPU is handed its address) with
+    /// syncs that cover its bytes only. It keeps the allocation alive
+    /// itself, as [`crate::Buffer::sub`]'s does.
+    pub fn sub(&self, offset: usize, bytes: usize) -> Result<Buffer, Error> {
+        if offset.checked_add(bytes).is_none_or(|end| end > self.bytes) {
+            return Err(Error::Buffer(format!(
+                "sub-buffer [{offset}, +{bytes}) outside a buffer of {} bytes",
+                self.bytes
+            )));
+        }
+        Ok(Buffer { bo: self.bo.clone(), offset: self.offset + offset, bytes, _not_sync: PhantomData })
+    }
+
+    /// [`sub`](Self::sub) in elements of `T`.
+    pub fn sub_of<T: Copy>(&self, offset: usize, n: usize) -> Result<Buffer, Error> {
+        let size = std::mem::size_of::<T>();
+        self.sub(offset * size, n * size)
     }
 
     /// The buffer as `T`s (as many as fit). Read after
     /// [`sync_from_device`](Self::sync_from_device).
     pub fn as_slice<T: Copy>(&self) -> &[T] {
-        // SAFETY: a page-aligned mapping of `size` bytes, live as long as self.
-        unsafe { std::slice::from_raw_parts(self.bo.ptr as *const T, self.bo.size / std::mem::size_of::<T>()) }
+        // SAFETY: `bytes` bytes of a live mapping; a sub-buffer's offset is
+        // the caller's to keep aligned for T, as with XRT's.
+        unsafe { std::slice::from_raw_parts(self.host() as *const T, self.bytes / std::mem::size_of::<T>()) }
     }
 
     /// The buffer as mutable `T`s. Follow with [`sync_to_device`](Self::sync_to_device).
     pub fn as_mut_slice<T: Copy>(&mut self) -> &mut [T] {
-        // SAFETY: as for as_slice, and `&mut self` makes this the only view.
-        unsafe { std::slice::from_raw_parts_mut(self.bo.ptr as *mut T, self.bo.size / std::mem::size_of::<T>()) }
+        // SAFETY: as for as_slice; `&mut self` makes this the only view
+        // through this Buffer (overlapping sub-buffers alias, as with XRT's).
+        unsafe { std::slice::from_raw_parts_mut(self.host() as *mut T, self.bytes / std::mem::size_of::<T>()) }
     }
 
     pub fn sync_to_device(&self) -> Result<(), Error> {
-        flush(self.bo.ptr, self.bo.size);
+        flush(self.host(), self.bytes);
         Ok(())
     }
 
     pub fn sync_from_device(&self) -> Result<(), Error> {
-        flush(self.bo.ptr, self.bo.size);
+        flush(self.host(), self.bytes);
         Ok(())
     }
 
