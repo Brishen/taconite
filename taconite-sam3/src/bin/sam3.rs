@@ -138,8 +138,8 @@ fn check(dir: &Path) -> R<bool> {
     let t1 = Instant::now();
     let fpn = m.neck(&rvit)?;
     let ms = t1.elapsed().as_secs_f64() * 1e3;
-    for i in 0..3 {
-        let cos = cosine(&fpn[i], m.store.f32(&format!("ref.fpn{i}"))?);
+    for (i, level) in fpn.iter().enumerate().take(3) {
+        let cos = cosine(level, m.store.f32(&format!("ref.fpn{i}"))?);
         c.check(&format!("neck level {i}"), cos > 0.995, format!("cosine {cos:.6} ({ms:.0} ms all)"));
     }
 

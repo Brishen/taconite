@@ -227,8 +227,8 @@ impl Sam3 {
         let mut out = Vec::with_capacity(boxes.len() / 4 * 4 * f);
         for b in boxes.chunks(4) {
             for coord in [b[1], b[0], b[2], b[3]] {
-                for i in 0..f {
-                    let v = coord * scale / dim_t[i];
+                for (i, &d) in dim_t.iter().enumerate().take(f) {
+                    let v = coord * scale / d;
                     out.push(if i % 2 == 0 { v.sin() } else { v.cos() });
                 }
             }

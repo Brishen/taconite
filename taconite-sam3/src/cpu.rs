@@ -8,7 +8,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 
 use taconite::{bf16_to_f32, fast_exp};
 
@@ -51,6 +51,11 @@ pub fn run_inline<R>(f: impl FnOnce() -> R) -> R {
 struct Pool {
     shared: Arc<Shared>,
     workers: usize,
+    /// Held while a job runs: `Shared` has one job slot, so a second
+    /// submitter -- another thread, or a task calling back into the pool
+    /// -- would overwrite the running job (a hang, or workers calling a
+    /// task that has already returned).
+    submit: Mutex<()>,
 }
 
 type Task<'a> = dyn Fn(usize) + Sync + 'a;
@@ -100,7 +105,7 @@ impl Pool {
                 .spawn(move || Self::work(&sh))
                 .expect("spawning a worker thread");
         }
-        Pool { shared, workers }
+        Pool { shared, workers, submit: Mutex::new(()) }
     }
 
     fn work(sh: &Shared) {
@@ -136,11 +141,21 @@ impl Pool {
         }
     }
 
-    /// Runs `f(0..n)` over the workers and this thread.
+    /// Runs `f(0..n)` over the workers and this thread -- or, when the
+    /// pool is already running a job (a concurrent caller, or a nested one
+    /// from inside a task), all on this thread.
     fn run(&self, n: usize, f: &Task<'_>) {
         if n == 0 {
             return;
         }
+        let _submit = match self.submit.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                (0..n).for_each(f);
+                return;
+            }
+        };
         let sh = &*self.shared;
         // the lifetime is erased for the workers; this call outlives them
         let task: *const Task<'static> = unsafe { std::mem::transmute(f as *const Task<'_>) };
@@ -460,24 +475,23 @@ pub fn ln_row(x: &[f32], y: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
     }
 }
 
-/// erf to 1.2e-7 (Numerical Recipes' erfc Chebyshev fit); std has none.
-#[inline]
 /// erf to ~1e-6 (Numerical Recipes' erfc Chebyshev fit), in f32 with the
 /// branch-free `fast_exp` so a loop over it vectorises: the neck's GELU
 /// runs it 10M times a forward, and libm's f64 exp was that pass.
+#[inline]
 pub fn erf(x: f32) -> f32 {
     let z = x.abs();
     let t = 1.0 / (1.0 + 0.5 * z);
     let r = t
         * fast_exp(
-            -z * z - 1.265_512_23
-                + t * (1.000_023_68
+            -z * z - 1.265_512_2
+                + t * (1.000_023_7
                     + t * (0.374_091_96
                         + t * (0.096_784_18
                             + t * (-0.186_288_06
                                 + t * (0.278_868_07
-                                    + t * (-1.135_203_98
-                                        + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77)))))))),
+                                    + t * (-1.135_204
+                                        + t * (1.488_515_9 + t * (-0.822_152_23 + t * 0.170_872_77)))))))),
         );
     // branch-free sign
     let pos = 1.0 - r;
@@ -586,8 +600,7 @@ pub fn attention(q: &[f32], dim: usize, k: Rows, v: Rows, a: &Attn) -> Vec<f32> 
                 softmax_(&mut s);
                 let oh = &mut orow[hh * hd..(hh + 1) * hd];
                 oh.fill(0.0);
-                for j in 0..lk {
-                    let p = s[j];
+                for (j, &p) in s.iter().enumerate().take(lk) {
                     if p != 0.0 {
                         for (o, &x) in oh.iter_mut().zip(v.at(j, hh * hd, hd)) {
                             *o += p * x;
@@ -673,6 +686,50 @@ fn dec_block(qs: &[f32], hd: usize, nq: usize, k: &[f32], v: &[f32], by: &[f32],
     dec_block_impl::<false>(qs, hd, nq, k, v, by, bx, g, s, o)
 }
 
+/// Attention against many keys with head-major keys and values
+/// (`kh`/`vh [H, lk, hd]`) and an additive `bias [H, lq, lk]`:
+/// `q [lq, H*hd]` -> `[lq, H*hd]`. The work is split over (head, query)
+/// pairs in head-major order, so each thread streams one head's keys --
+/// a few hundred KB, L2-resident -- for all of its queries.
+///
+/// The decoder no longer uses this (see [`attention_dec`], several times
+/// faster for its separable box bias); kept for callers of 0.1.
+pub fn attention_hm(q: &[f32], dim: usize, heads: usize, kh: &[f32], vh: &[f32], bias: Option<&[f32]>) -> Vec<f32> {
+    let hd = dim / heads;
+    let lk = kh.len() / dim;
+    let lq = q.len() / dim;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut oh = vec![0f32; heads * lq * hd]; // [H, lq, hd]
+    par_rows(&mut oh, hd, |r0, piece| {
+        let mut s = vec![0f32; lk];
+        for (ri, o) in piece.chunks_mut(hd).enumerate() {
+            let (h, i) = ((r0 + ri) / lq, (r0 + ri) % lq);
+            let qh = &q[i * dim + h * hd..][..hd];
+            let k = &kh[h * lk * hd..(h + 1) * lk * hd];
+            let b = bias.map(|b| &b[(h * lq + i) * lk..][..lk]);
+            for j in 0..lk {
+                s[j] = dot(qh, &k[j * hd..(j + 1) * hd]) * scale + b.map_or(0.0, |b| b[j]);
+            }
+            softmax_(&mut s);
+            let v = &vh[h * lk * hd..(h + 1) * lk * hd];
+            o.fill(0.0);
+            for j in 0..lk {
+                let p = s[j];
+                for (od, &x) in o.iter_mut().zip(&v[j * hd..(j + 1) * hd]) {
+                    *od += p * x;
+                }
+            }
+        }
+    });
+    let mut out = vec![0f32; lq * dim];
+    for h in 0..heads {
+        for i in 0..lq {
+            out[i * dim + h * hd..][..hd].copy_from_slice(&oh[(h * lq + i) * hd..][..hd]);
+        }
+    }
+    out
+}
+
 /// The DETR decoder's vision cross-attention: `q [lq, H*hd]` against
 /// transposed keys `kt [H, hd, lk]` and values `vh [H, lk, hd]`, with the
 /// box relative-position bias in its separable form, `by [H, lq, g]` +
@@ -686,6 +743,7 @@ fn dec_block(qs: &[f32], hd: usize, nq: usize, k: &[f32], v: &[f32], by: &[f32],
 /// once per block for all `QB` queries. One head's keys and values are
 /// 1.3 MB; streaming them per query, not per block, was what bounded the
 /// earlier version.
+#[allow(clippy::too_many_arguments)]
 pub fn attention_dec(
     q: &[f32],
     dim: usize,
@@ -969,8 +1027,32 @@ mod tests {
         for (x, e) in
             [(0.0f32, 0.0f32), (0.5, 0.520_499_9), (1.0, 0.842_700_8), (-2.0, -0.995_322_3), (3.0, 0.999_977_9)]
         {
-            assert!((erf(x) - e).abs() < 3e-7, "erf({x}) = {} vs {e}", erf(x));
+            // the documented ~1e-6 (fast_exp's f32; libm's f64 exp gave 1.2e-7)
+            assert!((erf(x) - e).abs() < 1e-6, "erf({x}) = {} vs {e}", erf(x));
         }
+    }
+
+    #[test]
+    fn par_rows_from_many_threads_and_nested() {
+        // concurrent submitters and a task calling back into the pool: both
+        // used to overwrite the pool's one job slot and hang
+        std::thread::scope(|s| {
+            for t in 0..4usize {
+                s.spawn(move || {
+                    for _ in 0..50 {
+                        let mut out = vec![0usize; 64 * 3];
+                        par_rows(&mut out, 3, |r0, piece| {
+                            let mut inner = vec![0usize; 8];
+                            par_rows(&mut inner, 1, |i0, p| p.iter_mut().enumerate().for_each(|(k, v)| *v = i0 + k));
+                            for (k, v) in piece.iter_mut().enumerate() {
+                                *v = t + r0 * 3 + k + inner.iter().sum::<usize>();
+                            }
+                        });
+                        assert!(out.iter().enumerate().all(|(i, &v)| v == t + i + 28));
+                    }
+                });
+            }
+        });
     }
 
     #[test]
