@@ -74,17 +74,18 @@ pub struct Io {
 /// Copies `src` into the start of `b` with wide, parallel copies (`b`'s
 /// host mapping is uncached: element-wise access to it is many times
 /// slower than streaming whole rows) and syncs it to the device.
-pub fn push(src: &[u16], b: &mut Buffer) -> Result<(), Error> {
-    let dst = &mut b.as_mut_slice::<u16>()[..src.len()];
+pub fn push<T: Copy + Send + Sync>(src: &[T], b: &mut Buffer) -> Result<(), Error> {
+    let dst = &mut b.as_mut_slice::<T>()[..src.len()];
     par_rows(dst, COPY, |r0, piece| piece.copy_from_slice(&src[r0 * COPY..][..piece.len()]));
     Ok(b.sync_to_device()?)
 }
 
-/// The first `n` bf16 of `b` (synced from the device) in cached memory.
-pub fn pull(b: &Buffer, n: usize) -> Result<Vec<u16>, Error> {
+/// The first `n` elements (bf16 bits, or f32) of `b` (synced from the
+/// device) in cached memory.
+pub fn pull<T: Copy + Default + Send + Sync>(b: &Buffer, n: usize) -> Result<Vec<T>, Error> {
     b.sync_from_device()?;
-    let src = &b.as_slice::<u16>()[..n];
-    let mut dst = vec![0u16; n];
+    let src = &b.as_slice::<T>()[..n];
+    let mut dst = vec![T::default(); n];
     par_rows(&mut dst, COPY, |r0, piece| piece.copy_from_slice(&src[r0 * COPY..][..piece.len()]));
     Ok(dst)
 }

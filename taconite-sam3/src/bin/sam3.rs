@@ -325,7 +325,7 @@ fn bench_copy() -> R<()> {
         taconite_sam3::npu::push(&src, &mut b)?;
         let push_s = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let v = taconite_sam3::npu::pull(&b, n)?;
+        let v = taconite_sam3::npu::pull::<u16>(&b, n)?;
         let pull_s = t.elapsed().as_secs_f64();
         let t = Instant::now();
         b.sync_from_device()?;

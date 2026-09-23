@@ -153,6 +153,9 @@ pub struct Config {
     /// every ViT layer on the device (RoPE, LayerNorms, residual adds);
     /// bundles from before it host that glue
     pub vit_device: bool,
+    /// the device ViT's residual stream in f32 (`AddLayerNorm(f32_residual)`);
+    /// bundles from before it keep it bf16
+    pub vit_res_f32: bool,
 }
 
 impl Config {
@@ -183,6 +186,7 @@ impl Config {
             neck_splits: m.list("neck_splits")?,
             mask_size: m.usize("mask_size")?,
             vit_device: m.param("vit_device").is_ok_and(|v| v == "1"),
+            vit_res_f32: m.param("vit_res_f32").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -328,7 +332,8 @@ impl Sam3 {
             m_head: npu.io("m_head", s * s)?,
             rope_out: if cfg.vit_device { Some(npu.session.alloc(t * 2 * cfg.vit_dim * 2)?) } else { None },
             xres: if cfg.vit_device {
-                vec![npu.session.alloc(t * cfg.vit_dim * 2)?, npu.session.alloc(t * cfg.vit_dim * 2)?]
+                let bytes = t * cfg.vit_dim * if cfg.vit_res_f32 { 4 } else { 2 };
+                vec![npu.session.alloc(bytes)?, npu.session.alloc(bytes)?]
             } else {
                 vec![]
             },

@@ -58,8 +58,8 @@ host pieces:
   [info] image decoding: 12593 of 921600 bytes differ from PIL's; after resize max 3.0 levels
 stages, each on the float32 reference's inputs:
   [ok] text encoder: cosine 1.000000
-  [ok] ViT backbone: cosine 0.983623
-  [ok] neck level 0 / 1 / 2: cosine 0.999961 / 0.999953 / 0.999968
+  [ok] ViT backbone: cosine 0.992325
+  [ok] neck level 0 / 1 / 2: cosine 0.999969 / 0.999984 / 0.999980
   [ok] DETR encoder: cosine 0.999722
   [ok] DETR decoder hidden: cosine 0.999831
   [ok] DETR decoder boxes: max |diff| 0.00008 over 3 confident queries
@@ -67,11 +67,11 @@ stages, each on the float32 reference's inputs:
   [ok] presence: 5.3509 vs 5.3441
   [ok] mask decoder masks: cosine 0.999991
 end to end (image file + prompt -> instances) against the reference cases:
-  [ok] cats.jpg / "cat": 2 instances (ref 2), min mask IoU 0.9989, max |score diff| 0.002
-  [ok] car.png / "car": 1 instances (ref 1), min mask IoU 0.9994, max |score diff| 0.007
-  [ok] cat_laptop.jpg / "laptop": 1 instances (ref 1), min mask IoU 0.9993, max |score diff| 0.000
+  [ok] cats.jpg / "cat": 2 instances (ref 2), min mask IoU 0.9992, max |score diff| 0.002
+  [ok] car.png / "car": 1 instances (ref 1), min mask IoU 0.9996, max |score diff| 0.006
+  [ok] cat_laptop.jpg / "laptop": 1 instances (ref 1), min mask IoU 0.9996, max |score diff| 0.001
   [ok] cat_laptop.jpg / "person": 0 instances (ref 0)
-  [ok] kitchen.jpg / "person": 2 instances (ref 2), min mask IoU 0.9982, max |score diff| 0.003
+  [ok] kitchen.jpg / "person": 2 instances (ref 2), min mask IoU 0.9989, max |score diff| 0.001
 ALL CHECKS PASSED
 ```
 
@@ -79,10 +79,17 @@ JPEG decoding (the `image` crate against PIL's libjpeg) differs by a
 level here and there; it shows up as the cases' small score differences,
 not in which instances are found.
 
+(The ViT's 0.9923 is with the backbone numerics of
+[`iron/applications/sam3`](../../applications/sam3/README.md#numerics):
+fp32 residual stream, exact softmax scale and exp2, bfp16 hi + lo
+activations. Bundles exported before them -- no `vit_res_f32` param --
+still run, at their 0.9836.)
+
 ## Performance
 
 Warm, one image + prompt, image file to instances, Ryzen AI 9 HX 370
-(quiet machine): **~2.5–2.6 s**, of which ~1.8 s is NPU execution:
+(quiet machine), before the backbone numerics above, which add ~0.4 s of
+NPU time: **~2.5–2.6 s**, of which ~1.8 s is NPU execution:
 
 ```
 text 72  vit 1493 (prologue 13, readback 3; the rest NPU)  neck 101
