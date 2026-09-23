@@ -14,6 +14,7 @@ default = ["cli"]
 cli = ["dep:image"]
 
 [dependencies]
+iron-bundle = { path = "../iron-bundle" }
 iron-xrt = { path = "../iron-xrt" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 

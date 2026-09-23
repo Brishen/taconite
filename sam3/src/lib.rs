@@ -67,6 +67,12 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<iron_bundle::Error> for Error {
+    fn from(e: iron_bundle::Error) -> Self {
+        Error::Bundle(e.to_string())
+    }
+}
+
 impl From<iron_xrt::Error> for Error {
     fn from(e: iron_xrt::Error) -> Self {
         Error::Npu(e.to_string())
@@ -176,7 +182,7 @@ impl Config {
             dec_layers: m.usize("dec_layers")?,
             neck_splits: m.list("neck_splits")?,
             mask_size: m.usize("mask_size")?,
-            vit_device: m.params.get("vit_device").is_some_and(|v| v == "1"),
+            vit_device: m.param("vit_device").is_ok_and(|v| v == "1"),
         })
     }
 
