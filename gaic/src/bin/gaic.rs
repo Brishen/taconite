@@ -185,6 +185,11 @@ fn crop(bundle: &Path, images: &[String], out: Option<&Path>, reps: usize, threa
             let f = g.features(&x, w, h)?;
             let mut lines = Vec::new();
             for (name, set) in demo_sets(w, h) {
+                // A portrait image has no 16:9 crop covering 40% of it.
+                if set.is_empty() {
+                    lines.push(format!("  {name:>4}: no candidates"));
+                    continue;
+                }
                 let s = g.score(&f, &as_f32_boxes(&set))?;
                 let i = argmax(&s);
                 let b = rescale_box(set[i], w, h, sw, sh);
