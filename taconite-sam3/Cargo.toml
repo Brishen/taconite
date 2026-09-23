@@ -9,6 +9,7 @@ rust-version = "1.85"
 description = "SAM3 (Segment Anything 3) text-prompted segmentation on an AMD XDNA NPU: IRON kernels replayed through XRT, no Python"
 license = "Apache-2.0 AND BSD-3-Clause AND MIT-CMU"
 readme = "README.md"
+repository = "https://github.com/Brishen/taconite"
 keywords = ["npu", "xdna", "sam3", "segmentation", "amd"]
 categories = ["computer-vision", "science", "command-line-utilities"]
 

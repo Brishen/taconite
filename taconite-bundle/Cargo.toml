@@ -9,6 +9,7 @@ rust-version = "1.85"
 description = "Reads the bundles IRON exporters write for Rust runtimes: manifest.txt records and the tensors.txt/tensors.bin store"
 license = "Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/Brishen/taconite"
 keywords = ["npu", "xdna", "iron", "aie", "amd"]
 categories = ["parser-implementations", "science"]
 

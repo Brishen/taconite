@@ -9,6 +9,7 @@ rust-version = "1.85"
 description = "Embeddable Rust runtime replaying exported AdaFace IR bundles on an AMD XDNA NPU via XRT (no Python)"
 license = "Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/Brishen/taconite"
 keywords = ["npu", "xdna", "adaface", "face-recognition", "amd"]
 categories = ["computer-vision", "science"]
 # `links` lets dependents read DEP_TACONITE_ADAFACE_LIBDIR in their build scripts (the
