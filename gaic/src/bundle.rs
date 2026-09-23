@@ -1,16 +1,30 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The bundle `iron/applications/gaic/export_gaic.py` writes: a plain-text
-//! `manifest.txt` naming the compiled kernels, the packed weights and the
-//! host-side parameters. See that script's docstring for the format.
+//! The bundle `iron/applications/gaic/export_gaic.py` writes, in the format
+//! every IRON bundle shares (read with [`iron_bundle`]): `manifest.txt`
+//! naming the compiled kernels and the layer table, the packed weights,
+//! host-side parameters and the self-check's references in the tensor
+//! store. See that script's docstring for every record and tensor.
+//!
+//! [`Bundle::load`] parses every record into the typed specs below and
+//! checks them against each other and against the tensors, so a mismatched
+//! bundle is an error naming the manifest line rather than garbage later.
 
-use std::fs;
 use std::path::{Path, PathBuf};
+
+use iron_bundle::{DType, Manifest, Record, Store};
 
 use crate::Error;
 
+/// The bundle format version this runtime reads (`export_gaic.VERSION`).
 pub const VERSION: u32 = 1;
+
+impl From<iron_bundle::Error> for Error {
+    fn from(e: iron_bundle::Error) -> Self {
+        Error::Bundle(e.to_string())
+    }
+}
 
 /// One compiled flm.GEMM: `C[M, N] = A[M, K] B[K, N]`, A read from
 /// `a_elems` bf16 (rows may overlap), B pre-packed (`b_bytes`).
@@ -43,21 +57,26 @@ pub struct ConvSpec {
     pub window: bool,
     /// Y's row width (view) / one pixel's [dy][c] run (window, = 3C).
     pub d: usize,
-    pub b: PathBuf,
-    pub bias: PathBuf,
+    /// Tensor: the packed B.
+    pub b: String,
+    /// Tensor: `[OC]` f32.
+    pub bias: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Fc1Spec {
     pub kernel: String,
-    pub b: PathBuf,
-    pub bias: PathBuf,
+    /// Tensor: the packed B.
+    pub b: String,
+    /// Tensor: `[n]` f32.
+    pub bias: String,
     pub k: usize,
     pub k_pad: usize,
     pub n: usize,
     pub m: usize,
 }
 
+/// The self-check image; its data are the `ref.*` tensors.
 #[derive(Debug, Clone)]
 pub struct RefSpec {
     pub image: String,
@@ -68,161 +87,149 @@ pub struct RefSpec {
     pub src_h: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct Manifest {
+pub struct Bundle {
     pub dir: PathBuf,
     pub kernels: Vec<KernelSpec>,
     pub convs: Vec<ConvSpec>,
     pub f3: String,
     pub f4: String,
-    pub dimred_w: PathBuf,
-    pub dimred_b: PathBuf,
+    /// Tensors: `[reddim, dimred_in]` / `[reddim]` f32.
+    pub dimred_w: String,
+    pub dimred_b: String,
     pub reddim: usize,
     pub dimred_in: usize,
     pub fc1: Fc1Spec,
-    pub fc2_w: PathBuf,
-    pub fc2_b: PathBuf,
+    /// Tensors: `[fc2_out, fc2_in]` / `[fc2_out]` / `[fc2_out]` / `[1]` f32.
+    pub fc2_w: String,
+    pub fc2_b: String,
     pub fc2_in: usize,
     pub fc2_out: usize,
-    pub fc3_w: PathBuf,
-    pub fc3_b: PathBuf,
+    pub fc3_w: String,
+    pub fc3_b: String,
     pub align_size: usize,
     pub spatial_scale: f32,
     pub reference: Option<RefSpec>,
+    /// Every tensor the records name.
+    pub store: Store,
 }
 
-fn bad(line: usize, msg: impl std::fmt::Display) -> Error {
-    Error::Bundle(format!("manifest.txt:{line}: {msg}"))
+fn once<T>(slot: &mut Option<T>, r: &Record, v: T) -> Result<(), Error> {
+    if slot.replace(v).is_some() {
+        return Err(r.error(format!("second {} record", r.tag)).into());
+    }
+    Ok(())
 }
 
-fn num<T: std::str::FromStr>(line: usize, s: &str) -> Result<T, Error> {
-    s.parse().map_err(|_| bad(line, format!("not a number: {s:?}")))
-}
-
-impl Manifest {
+impl Bundle {
+    /// Read and check `<dir>`'s manifest and tensors.
     pub fn load(dir: &Path) -> Result<Self, Error> {
-        let path = dir.join("manifest.txt");
-        let text = fs::read_to_string(&path).map_err(|e| Error::Bundle(format!("{}: {e}", path.display())))?;
-        let f = |s: &str| dir.join(s);
-        let mut version = None;
-        let mut kernels = Vec::new();
-        let mut convs = Vec::new();
-        let (mut f3, mut f4) = (None, None);
-        let mut dimred = None;
-        let mut fc1 = None;
-        let mut fc2 = None;
-        let mut fc3 = None;
-        let mut align = None;
-        let mut reference = None;
-        for (i, raw) in text.lines().enumerate() {
-            let ln = i + 1;
-            let t: Vec<&str> = raw.split_whitespace().collect();
-            let Some(&tag) = t.first() else { continue };
-            let want = |n: usize| {
-                if t.len() == n { Ok(()) } else { Err(bad(ln, format!("{tag}: {} fields, expected {n}", t.len()))) }
-            };
-            match tag {
-                "gaic" => {
-                    want(2)?;
-                    version = Some(num::<u32>(ln, t[1])?);
-                }
+        let manifest_path = dir.join(Manifest::FILE);
+        if !dir.join("tensors.txt").exists()
+            && std::fs::read_to_string(&manifest_path).is_ok_and(|t| t.starts_with("gaic "))
+        {
+            return Err(Error::Bundle(format!(
+                "{} is an old-format GAIC bundle (`gaic <version>` manifest, one file a tensor); \
+                 re-export it with python -m iron.applications.gaic.export_gaic",
+                dir.display()
+            )));
+        }
+        let m = Manifest::load(dir, VERSION)?;
+        let store = Store::load(dir)?;
+
+        let mut kernels: Vec<KernelSpec> = Vec::new();
+        let mut convs: Vec<ConvSpec> = Vec::new();
+        let (mut dimred, mut fc1, mut fc2, mut fc3, mut reference) = (None, None, None, None, None);
+        for r in m.records() {
+            match r.tag.as_str() {
                 "kernel" => {
-                    want(11)?;
+                    let key = r.field(0)?.to_string();
+                    if kernels.iter().any(|k| k.key == key) {
+                        return Err(r.error(format!("kernel {key} defined twice")).into());
+                    }
+                    let x = m.xclbin(r.str("ctx")?).map_err(|e| r.error(e))?;
                     kernels.push(KernelSpec {
-                        key: t[1].into(),
-                        xclbin: f(t[2]),
-                        insts: f(t[3]),
-                        name: t[4].into(),
-                        m: num(ln, t[5])?,
-                        k: num(ln, t[6])?,
-                        n: num(ln, t[7])?,
-                        a_elems: num(ln, t[8])?,
-                        b_bytes: num(ln, t[9])?,
-                        c_elems: num(ln, t[10])?,
+                        key,
+                        xclbin: x.path.clone(),
+                        insts: m.path(r.str("insts")?),
+                        name: x.kernel.clone(),
+                        m: r.get("M")?,
+                        k: r.get("K")?,
+                        n: r.get("N")?,
+                        a_elems: r.get("a_elems")?,
+                        b_bytes: r.get("b_bytes")?,
+                        c_elems: r.get("c_elems")?,
                     });
                 }
                 "conv" => {
-                    want(12)?;
+                    let name = r.field(0)?.to_string();
+                    if convs.iter().any(|c| c.name == name) {
+                        return Err(r.error(format!("conv {name} defined twice")).into());
+                    }
                     convs.push(ConvSpec {
-                        name: t[1].into(),
-                        kernel: t[2].into(),
-                        c: num(ln, t[3])?,
-                        oc: num(ln, t[4])?,
-                        pool_before: num::<u8>(ln, t[5])? != 0,
-                        m_chunk: num(ln, t[6])?,
-                        p: num(ln, t[7])?,
-                        window: num::<u8>(ln, t[8])? != 0,
-                        d: num(ln, t[9])?,
-                        b: f(t[10]),
-                        bias: f(t[11]),
+                        name,
+                        kernel: r.str("kernel")?.into(),
+                        c: r.get("C")?,
+                        oc: r.get("OC")?,
+                        pool_before: r.flag("pool_before")?,
+                        m_chunk: r.get("m_chunk")?,
+                        p: r.get("P")?,
+                        window: r.flag("window")?,
+                        d: r.get("D")?,
+                        b: r.str("b")?.into(),
+                        bias: r.str("bias")?.into(),
                     });
-                }
-                "f3" => {
-                    want(2)?;
-                    f3 = Some(t[1].to_string());
-                }
-                "f4" => {
-                    want(2)?;
-                    f4 = Some(t[1].to_string());
                 }
                 "dimred" => {
-                    want(5)?;
-                    dimred = Some((f(t[1]), f(t[2]), num(ln, t[3])?, num(ln, t[4])?));
+                    let v = (r.str("w")?.to_string(), r.str("b")?.to_string(), r.get("out")?, r.get("in")?);
+                    once(&mut dimred, r, v)?;
                 }
                 "fc1" => {
-                    want(8)?;
-                    fc1 = Some(Fc1Spec {
-                        kernel: t[1].into(),
-                        b: f(t[2]),
-                        bias: f(t[3]),
-                        k: num(ln, t[4])?,
-                        k_pad: num(ln, t[5])?,
-                        n: num(ln, t[6])?,
-                        m: num(ln, t[7])?,
-                    });
+                    let v = Fc1Spec {
+                        kernel: r.str("kernel")?.into(),
+                        b: r.str("b")?.into(),
+                        bias: r.str("bias")?.into(),
+                        k: r.get("k")?,
+                        k_pad: r.get("k_pad")?,
+                        n: r.get("n")?,
+                        m: r.get("m")?,
+                    };
+                    once(&mut fc1, r, v)?;
                 }
                 "fc2" => {
-                    want(5)?;
-                    fc2 = Some((f(t[1]), f(t[2]), num(ln, t[3])?, num(ln, t[4])?));
+                    let v = (r.str("w")?.to_string(), r.str("b")?.to_string(), r.get("in")?, r.get("out")?);
+                    once(&mut fc2, r, v)?;
                 }
                 "fc3" => {
-                    want(4)?;
-                    fc3 = Some((f(t[1]), f(t[2])));
-                }
-                "align" => {
-                    want(3)?;
-                    align = Some((num(ln, t[1])?, num(ln, t[2])?));
+                    let v = (r.str("w")?.to_string(), r.str("b")?.to_string(), r.get::<usize>("in")?);
+                    once(&mut fc3, r, v)?;
                 }
                 "ref" => {
-                    want(7)?;
-                    reference = Some(RefSpec {
-                        image: t[1].into(),
-                        w: num(ln, t[2])?,
-                        h: num(ln, t[3])?,
-                        n_anchors: num(ln, t[4])?,
-                        src_w: num(ln, t[5])?,
-                        src_h: num(ln, t[6])?,
-                    });
+                    let v = RefSpec {
+                        image: r.str("image")?.into(),
+                        w: r.get("w")?,
+                        h: r.get("h")?,
+                        n_anchors: r.get("anchors")?,
+                        src_w: r.get("src_w")?,
+                        src_h: r.get("src_h")?,
+                    };
+                    once(&mut reference, r, v)?;
                 }
-                _ => return Err(bad(ln, format!("unknown record {tag:?}"))),
+                _ => return Err(r.error(format!("unknown record {:?}", r.tag)).into()),
             }
         }
-        match version {
-            Some(VERSION) => {}
-            Some(v) => return Err(Error::Bundle(format!("bundle version {v}, this runtime reads {VERSION}"))),
-            None => return Err(Error::Bundle("manifest.txt has no `gaic <version>` line".into())),
-        }
-        let missing = |what: &str| Error::Bundle(format!("manifest.txt has no {what} record"));
+        let missing = |what: &str| Error::Bundle(format!("{}: no {what} record", manifest_path.display()));
         let (dimred_w, dimred_b, reddim, dimred_in) = dimred.ok_or_else(|| missing("dimred"))?;
         let (fc2_w, fc2_b, fc2_in, fc2_out) = fc2.ok_or_else(|| missing("fc2"))?;
-        let (fc3_w, fc3_b) = fc3.ok_or_else(|| missing("fc3"))?;
-        let (align_size, spatial_scale) = align.ok_or_else(|| missing("align"))?;
-        let m = Manifest {
+        let (fc3_w, fc3_b, fc3_in) = fc3.ok_or_else(|| missing("fc3"))?;
+        if fc3_in != fc2_out {
+            return Err(Error::Bundle(format!("fc3 takes {fc3_in} inputs, fc2 makes {fc2_out}")));
+        }
+        let b = Bundle {
             dir: dir.to_path_buf(),
             kernels,
             convs,
-            f3: f3.ok_or_else(|| missing("f3"))?,
-            f4: f4.ok_or_else(|| missing("f4"))?,
+            f3: m.param("f3")?.to_string(),
+            f4: m.param("f4")?.to_string(),
             dimred_w,
             dimred_b,
             reddim,
@@ -234,12 +241,14 @@ impl Manifest {
             fc2_out,
             fc3_w,
             fc3_b,
-            align_size,
-            spatial_scale,
+            align_size: m.param_as("align_size")?,
+            spatial_scale: m.param_as("spatial_scale")?,
             reference,
+            store,
         };
-        m.validate()?;
-        Ok(m)
+        b.validate()?;
+        b.validate_tensors()?;
+        Ok(b)
     }
 
     pub fn kernel(&self, key: &str) -> Result<&KernelSpec, Error> {
@@ -297,25 +306,59 @@ impl Manifest {
         }
         Ok(())
     }
-}
 
-/// Little-endian f32s from a file (the exporter's `.f32`s).
-pub fn read_f32(path: &Path) -> Result<Vec<f32>, Error> {
-    let bytes = fs::read(path).map_err(|e| Error::Bundle(format!("{}: {e}", path.display())))?;
-    if bytes.len() % 4 != 0 {
-        return Err(Error::Bundle(format!("{}: {} bytes is not whole f32s", path.display(), bytes.len())));
+    /// Every tensor a record names exists with the size the record implies.
+    fn validate_tensors(&self) -> Result<(), Error> {
+        let st = &self.store;
+        let packed = |name: &str, bytes: usize| -> Result<(), Error> {
+            let got = st.bytes(name)?.len();
+            if got != bytes {
+                return Err(Error::Bundle(format!("tensor {name} is {got} bytes, the kernel takes {bytes}")));
+            }
+            Ok(())
+        };
+        for c in &self.convs {
+            packed(&c.b, self.kernel(&c.kernel)?.b_bytes)?;
+            st.expect(&c.bias, DType::F32, c.oc)?;
+        }
+        packed(&self.fc1.b, self.kernel(&self.fc1.kernel)?.b_bytes)?;
+        st.expect(&self.fc1.bias, DType::F32, self.fc1.n)?;
+        st.expect(&self.dimred_w, DType::F32, self.reddim * self.dimred_in)?;
+        st.expect(&self.dimred_b, DType::F32, self.reddim)?;
+        st.expect(&self.fc2_w, DType::F32, self.fc2_out * self.fc2_in)?;
+        st.expect(&self.fc2_b, DType::F32, self.fc2_out)?;
+        st.expect(&self.fc3_w, DType::F32, self.fc2_out)?;
+        st.expect(&self.fc3_b, DType::F32, 1)?;
+        if let Some(r) = &self.reference {
+            let red = self.reddim * (r.h / 16) * (r.w / 16);
+            st.expect("ref.src_rgb", DType::U8, r.src_h * r.src_w * 3)?;
+            st.expect("ref.input_chw", DType::F32, 3 * r.h * r.w)?;
+            st.expect("ref.red_cpu", DType::F32, red)?;
+            st.expect("ref.red_npu", DType::F32, red)?;
+            st.expect("ref.anchors", DType::I32, r.n_anchors * 4)?;
+            st.expect("ref.scores_cpu", DType::F32, r.n_anchors)?;
+            st.expect("ref.scores_npu", DType::F32, r.n_anchors)?;
+        }
+        Ok(())
     }
-    Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
-}
 
-pub fn read_f32_n(path: &Path, n: usize) -> Result<Vec<f32>, Error> {
-    let v = read_f32(path)?;
-    if v.len() != n {
-        return Err(Error::Bundle(format!("{}: {} values, expected {n}", path.display(), v.len())));
+    /// An f32 tensor, copied.
+    pub fn f32_vec(&self, name: &str) -> Result<Vec<f32>, Error> {
+        Ok(self.store.f32(name)?.to_vec())
     }
-    Ok(v)
 }
 
-pub fn read_bytes(path: &Path) -> Result<Vec<u8>, Error> {
-    fs::read(path).map_err(|e| Error::Bundle(format!("{}: {e}", path.display())))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_bundle_is_rejected_with_a_hint() {
+        let d = std::env::temp_dir().join(format!("gaic-old-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("manifest.txt"), "gaic 1\nf3 conv4_3\n").unwrap();
+        let e = Bundle::load(&d).err().unwrap().to_string();
+        assert!(e.contains("old-format GAIC bundle") && e.contains("export_gaic"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

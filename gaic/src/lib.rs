@@ -38,7 +38,7 @@ use iron_xrt::{Buffer, Kernel, Session, bf16_to_f32, f32_to_bf16};
 
 use par::par_rows;
 
-use bundle::{ConvSpec, Manifest, read_bytes, read_f32_n};
+use bundle::{Bundle, ConvSpec};
 
 #[derive(Debug)]
 pub enum Error {
@@ -140,7 +140,7 @@ struct LayerPlan {
 }
 
 pub struct Gaic {
-    manifest: Manifest,
+    bundle: Bundle,
     session: Session,
     kernels: HashMap<String, Kernel>,
     layers: Vec<Layer>,
@@ -187,55 +187,49 @@ impl Gaic {
     /// Opens the NPU and loads a bundle: every kernel into a resident
     /// hardware context, every weight into a device buffer.
     pub fn load(bundle: &Path) -> Result<Self, Error> {
-        let manifest = Manifest::load(bundle)?;
+        let bundle = Bundle::load(bundle)?;
         let session = Session::open(0)?;
         let mut kernels = HashMap::new();
-        for k in &manifest.kernels {
+        for k in &bundle.kernels {
             let ops = 2 * (k.m * k.k * k.n) as u64;
             kernels.insert(k.key.clone(), session.load_kernel(&k.xclbin, &k.insts, Some(&k.name), ops)?);
         }
-        let upload = |path: &Path, bytes: usize| -> Result<Buffer, Error> {
-            let data = read_bytes(path)?;
-            if data.len() != bytes {
-                return Err(Error::Bundle(format!(
-                    "{}: {} bytes, the kernel takes {bytes}",
-                    path.display(),
-                    data.len()
-                )));
-            }
-            let mut b = session.alloc(bytes)?;
-            b.write(&data)?;
+        // Packed weights; their sizes were checked against the kernels at load.
+        let upload = |name: &str| -> Result<Buffer, Error> {
+            let data = bundle.store.bytes(name)?;
+            let mut b = session.alloc(data.len())?;
+            b.write(data)?;
             Ok(b)
         };
         let mut layers = Vec::new();
-        for c in &manifest.convs {
-            let k = manifest.kernel(&c.kernel)?;
+        for c in &bundle.convs {
+            let k = bundle.kernel(&c.kernel)?;
             layers.push(Layer {
                 spec: c.clone(),
                 k: k.k,
                 a_elems: k.a_elems,
                 c_elems: k.c_elems,
-                b: upload(&c.b, k.b_bytes)?,
-                bias: read_f32_n(&c.bias, c.oc)?,
+                b: upload(&c.b)?,
+                bias: bundle.f32_vec(&c.bias)?,
             });
         }
-        let idx = |name: &str| manifest.convs.iter().position(|c| c.name == name).unwrap();
-        let (f3, f4) = (idx(&manifest.f3), idx(&manifest.f4));
-        let fk = manifest.kernel(&manifest.fc1.kernel)?;
-        let fc1_b = upload(&manifest.fc1.b, fk.b_bytes)?;
+        let idx = |name: &str| bundle.convs.iter().position(|c| c.name == name).unwrap();
+        let (f3, f4) = (idx(&bundle.f3), idx(&bundle.f4));
+        let fk = bundle.kernel(&bundle.fc1.kernel)?;
+        let fc1_b = upload(&bundle.fc1.b)?;
         let fc1_a = session.alloc_of::<u16>(fk.a_elems)?;
         let fc1_c = session.alloc_of::<u16>(fk.c_elems)?;
-        let m = &manifest;
-        let dimred_w = read_f32_n(&m.dimred_w, m.reddim * m.dimred_in)?;
-        let dimred_b = read_f32_n(&m.dimred_b, m.reddim)?;
-        let fc1_bias = read_f32_n(&m.fc1.bias, m.fc1.n)?;
-        let fc2_w = read_f32_n(&m.fc2_w, m.fc2_out * m.fc2_in)?;
-        let fc2_b = read_f32_n(&m.fc2_b, m.fc2_out)?;
-        let fc3_w = read_f32_n(&m.fc3_w, m.fc2_out)?;
-        let fc3_b = read_f32_n(&m.fc3_b, 1)?[0];
+        let m = &bundle;
+        let dimred_w = m.f32_vec(&m.dimred_w)?;
+        let dimred_b = m.f32_vec(&m.dimred_b)?;
+        let fc1_bias = m.f32_vec(&m.fc1.bias)?;
+        let fc2_w = m.f32_vec(&m.fc2_w)?;
+        let fc2_b = m.f32_vec(&m.fc2_b)?;
+        let fc3_w = m.f32_vec(&m.fc3_w)?;
+        let fc3_b = m.f32_vec(&m.fc3_b)?[0];
         let threads = par::default_threads();
         Ok(Self {
-            manifest,
+            bundle,
             session,
             kernels,
             layers,
@@ -257,8 +251,10 @@ impl Gaic {
         })
     }
 
-    pub fn manifest(&self) -> &Manifest {
-        &self.manifest
+    /// The loaded bundle: its layer table, and the tensor store (weights and
+    /// the self-check's `ref.*` references).
+    pub fn bundle(&self) -> &Bundle {
+        &self.bundle
     }
 
     pub fn reset_timing(&mut self) {
@@ -389,8 +385,8 @@ impl Gaic {
         let ch = self.layers[self.f4].spec.oc;
         let (h5, w5) = (l4.h / 2, l4.w / 2);
         let f5 = maxpool_f32(&f4, l4.h, l4.w, ch);
-        let r = self.manifest.reddim;
-        let cin = self.manifest.dimred_in;
+        let r = self.bundle.reddim;
+        let cin = self.bundle.dimred_in;
         let proj = |f: &[f32], off: usize| -> Vec<f32> {
             let px = f.len() / ch;
             let mut g = vec![0f32; px * r];
@@ -422,7 +418,7 @@ impl Gaic {
     /// Scores `boxes` (`[x1, y1, x2, y2]` in the input's pixels) against an
     /// image's [`Features`]; higher is a better crop.
     pub fn score(&mut self, f: &Features, boxes: &[[f32; 4]]) -> Result<Vec<f32>, Error> {
-        let m = &self.manifest;
+        let m = &self.bundle;
         let (s, scale) = (m.align_size, m.spatial_scale);
         let (k, k_pad, n1, rows) = (m.fc1.k, m.fc1.k_pad, m.fc1.n, m.fc1.m);
         let threads = self.threads;
