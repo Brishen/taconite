@@ -183,6 +183,10 @@ unsafe impl Send for Buffer {}
 
 impl Session {
     /// Opens NPU `device_index` (0 on a laptop).
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the handles are Send (see their impls), so the refcount they share must be atomic"
+    )]
     pub fn open(device_index: u32) -> Result<Self, Error> {
         let mut err = err_buf();
         // SAFETY: err is ERR_LEN bytes; the shim writes within it.
@@ -472,9 +476,9 @@ pub fn fast_exp(x: f32) -> f32 {
     let f = t - n;
     // 2^f on [0, 1): Cephes' exp2f polynomial (max rel err ~2e-7).
     let p = 1.0
-        + f * (6.931_472_0e-1
+        + f * (6.931_472e-1
             + f * (2.402_264_8e-1
-                + f * (5.550_332_5e-2 + f * (9.618_437_4e-3 + f * (1.339_887_4e-3 + f * 1.535_336_2e-4)))));
+                + f * (5.550_332_5e-2 + f * (9.618_438e-3 + f * (1.339_887_4e-3 + f * 1.535_336_2e-4)))));
     f32::from_bits(p.to_bits().wrapping_add((n as i32 as u32) << 23))
 }
 

@@ -555,6 +555,10 @@ impl Session {
     }
 
     /// Opens the accel node at `path` and sets up the device heap.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the handles are Send (see their impls), so the refcount they share must be atomic"
+    )]
     pub fn open_path(path: &Path) -> Result<Self, Error> {
         let file = OpenOptions::new()
             .read(true)
@@ -664,6 +668,10 @@ impl Session {
     /// context runs the xclbin's one PDI whatever `kernel_name` says; the
     /// name only tells contexts apart. `ops_per_run` is declared to the
     /// driver as the context's QoS `gops`.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the handles are Send (see their impls), so the refcount they share must be atomic"
+    )]
     pub fn load_kernel(
         &self,
         xclbin: &Path,
@@ -748,6 +756,10 @@ impl Session {
 
     /// A zeroed buffer of `bytes` bytes the NPU and the host share, usable
     /// as an argument of any kernel of this session.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the handles are Send (see their impls), so the refcount they share must be atomic"
+    )]
     pub fn alloc(&self, bytes: usize) -> Result<Buffer, Error> {
         let dev = &self.inner;
         let berr = |what: &'static str| move |e: io::Error| Error::Buffer(format!("{what} ({bytes} bytes): {e}"));
