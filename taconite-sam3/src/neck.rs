@@ -17,9 +17,9 @@
 //! level 0's GELU and pixel shuffle happen here, then its second ConvT
 //! (1x1 folded in) on the NPU; every level ends with its 3x3.
 
-use taconite::{bf16_to_f32, f32_to_bf16};
+use taconite::bf16_to_f32;
 
-use crate::cpu::{gelu, par_rows};
+use crate::cpu::{gelu_bf16, par_rows};
 use crate::npu::pull;
 use crate::{Error, Sam3, gemm, narrow};
 
@@ -34,6 +34,7 @@ impl Sam3 {
         let oc = bias.len();
         let wp = side + 2;
         let n = side * wp;
+        let t0 = std::time::Instant::now();
         let mut ybuf = vec![0u16; n * d];
         par_rows(&mut ybuf, d, |p0, piece| {
             for (pi, row) in piece.chunks_mut(d).enumerate() {
@@ -53,8 +54,10 @@ impl Sam3 {
         });
         let io = self.io.conv.get_mut(&side).ok_or_else(|| Error::Input(format!("no conv buffers for {side} px")))?;
         io.set_a(&ybuf)?;
+        self.timing.add("conv_in", t0.elapsed());
         let io = &self.io.conv[&side];
         gemm(&mut self.npu, io, &self.w[wkey], &mut self.timing)?;
+        let t0 = std::time::Instant::now();
         let out_bf = pull(&io.c, n * oc)?;
         let mut out = vec![0f32; side * side * oc];
         par_rows(&mut out, side * oc, |y0, piece| {
@@ -65,6 +68,7 @@ impl Sam3 {
                 }
             }
         });
+        self.timing.add("conv_out", t0.elapsed());
         Ok(out)
     }
 
@@ -80,6 +84,7 @@ impl Sam3 {
         narrow(vit, &mut vb);
         self.io.n_in.set_a(&vb)?;
         gemm(&mut self.npu, &self.io.n_in, &self.w["n.in"], &mut self.timing)?;
+        let t0 = std::time::Instant::now();
         let y = self.io.n_in.get_c(t)?;
         let y = &y[..];
 
@@ -92,9 +97,7 @@ impl Sam3 {
                 let r = r0 + ri;
                 let (yy, xx) = (r / g2, r % g2);
                 let src = &y[((yy / 2) * g + xx / 2) * width + ((yy % 2) * 2 + xx % 2) * mid..][..mid];
-                for (o, &v) in row.iter_mut().zip(src) {
-                    *o = f32_to_bf16(gelu(bf16_to_f32(v)));
-                }
+                gelu_bf16(src, row);
             }
         });
         // levels 1 and 2 straight from the shared GEMM
@@ -116,7 +119,9 @@ impl Sam3 {
             row.copy_from_slice(&y[p * width + s0 + s1..][..fpn]);
         }
         self.io.n_up.set_a(&a0)?;
+        self.timing.add("neck_gelu_shuffle", t0.elapsed());
         gemm(&mut self.npu, &self.io.n_up, &self.w["n.up"], &mut self.timing)?;
+        let t0 = std::time::Instant::now();
         let up = self.io.n_up.get_c(4 * t)?;
         let n_up = self.npu.spec("n_up")?.n;
         let mut u0 = vec![0u16; 16 * t * fpn];
@@ -131,6 +136,7 @@ impl Sam3 {
                 }
             });
         }
+        self.timing.add("neck_up_shuffle", t0.elapsed());
         let b: Vec<Vec<f32>> =
             (0..3).map(|i| self.store.f32(&format!("n.conv{i}.b")).map(<[f32]>::to_vec)).collect::<Result<_, _>>()?;
         let f0 = self.conv3x3(&u0, 4 * g, "n.conv0", &b[0])?;

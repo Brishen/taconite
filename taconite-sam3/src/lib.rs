@@ -210,7 +210,7 @@ pub struct Output {
 }
 
 /// NPU operands, allocated once per session.
-struct Ios {
+pub(crate) struct Ios {
     v_embed: Io,
     v_qkv: Io,
     v_o: Io,
@@ -232,8 +232,8 @@ struct Ios {
     m_head: Io,
     /// device-resident ViT: RoPE output `[T, 2 D]`, the residual stream's
     /// two ping-pong buffers `[T, D]`
-    rope_out: Option<Buffer>,
-    xres: Vec<Buffer>,
+    pub(crate) rope_out: Option<Buffer>,
+    pub(crate) xres: Vec<Buffer>,
 }
 
 pub struct Sam3 {
@@ -355,19 +355,41 @@ impl Sam3 {
     }
 
     /// Everything for one image and prompt: `pixels` is the preprocessed
-    /// `[3, 1008, 1008]` image ([`preprocess`]).
+    /// `[3, 1008, 1008]` image ([`preprocess`]). The text encoder (host)
+    /// runs on a side thread while the ViT has the NPU.
     pub fn segment(&mut self, pixels: &[f32], prompt: &str) -> Result<Output, Error> {
-        let text = self.time("text", |s| {
-            let (ids, mask) = s.tokenizer.encode(prompt);
-            s.text(&ids, &mask)
-        })?;
-        self.forward(pixels, &text)
+        let (ids, mask) = self.tokenizer.encode(prompt);
+        if !self.cfg.vit_device {
+            let text = self.time("text", |s| s.text(&ids, &mask))?;
+            return self.forward(pixels, &text);
+        }
+        let Sam3 { store, cfg, npu, io, w, timing, .. } = self;
+        let (text, vit) = std::thread::scope(|s| {
+            let encoder = s.spawn(|| {
+                let t0 = Instant::now();
+                let r = cpu::run_inline(|| text::encode(store, cfg, &ids, &mask));
+                (r, t0.elapsed())
+            });
+            let t0 = Instant::now();
+            let vit = vit::vit_device(npu, io, w, store, cfg, timing, pixels);
+            timing.add("vit", t0.elapsed());
+            let (text, dt) = encoder.join().expect("the text encoder thread");
+            timing.add("text", dt);
+            (text, vit)
+        });
+        let (text, vit) = (text?, vit?);
+        self.finish(&vit, &text)
     }
 
     /// The forward from preprocessed pixels and an encoded prompt.
     pub fn forward(&mut self, pixels: &[f32], text: &Text) -> Result<Output, Error> {
         let vit = self.time("vit", |s| s.vit(pixels))?;
-        let fpn = self.time("neck", |s| s.neck(&vit))?;
+        self.finish(&vit, text)
+    }
+
+    /// The forward after the backbone.
+    fn finish(&mut self, vit: &[f32], text: &Text) -> Result<Output, Error> {
+        let fpn = self.time("neck", |s| s.neck(vit))?;
         let enc = self.time("detr_enc", |s| s.detr_encoder(&fpn[2], text))?;
         let dec = self.time("detr_dec", |s| s.detr_decoder(&enc, text))?;
         let (masks, semantic) = self.time("mask_dec", |s| s.mask_decoder(&dec.hidden, &fpn, &enc, text))?;

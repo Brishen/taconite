@@ -16,16 +16,19 @@
 
 use taconite::{bf16_to_f32, f32_to_bf16};
 
+use std::collections::HashMap;
+
+use crate::bundle::Store;
 use crate::cpu::{ln_row, par_rows};
-use crate::npu::{pull, push};
-use crate::{Error, Sam3, gemm, gemm_dev, mha, op};
+use crate::npu::{Buffer, Npu, pull, push};
+use crate::{Config, Error, Ios, Sam3, Timing, gemm, gemm_dev, mha, op};
 
 impl Sam3 {
     /// `pixels [3, S, S]` -> the backbone's last hidden state `[T, 1024]`,
     /// raster order.
     pub fn vit(&mut self, pixels: &[f32]) -> Result<Vec<f32>, Error> {
         if self.cfg.vit_device {
-            return self.vit_device(pixels);
+            return vit_device(&mut self.npu, &mut self.io, &self.w, &self.store, &self.cfg, &mut self.timing, pixels);
         }
         let c = self.cfg.clone();
         let (t, dim, g, ps, s) = (c.tokens(), c.vit_dim, c.grid, c.patch, c.image_size);
@@ -165,31 +168,41 @@ impl Sam3 {
     }
 }
 
-impl Sam3 {
-    /// The backbone with every layer on the device (bundles with
-    /// `vit_device`, `iron/applications/sam3/sam3_npu.py`'s
-    /// `_forward_device`): per layer
+/// The backbone with every layer on the device (bundles with
+/// `vit_device`, `iron/applications/sam3/sam3_npu.py`'s
+/// `_forward_device`): per layer
     ///
-    ///   qkv GEMM -> RoPE(q | k) -> MHA -> o GEMM -> AddLN(+o) -> fc1 ->
-    ///   fc2 -> AddLN(+fc2)
-    ///
-    /// each kernel reading the previous one's output buffer in place; the
-    /// host embeds the patches and normalises once before layer 0 and
-    /// reads the residual stream (f32 on the device with `vit_res_f32`,
-    /// else bf16) after layer 31.
-    fn vit_device(&mut self, pixels: &[f32]) -> Result<Vec<f32>, Error> {
-        let c = self.cfg.clone();
+///   qkv GEMM -> RoPE(q | k) -> MHA -> o GEMM -> AddLN(+o) -> fc1 ->
+///   fc2 -> AddLN(+fc2)
+///
+/// each kernel reading the previous one's output buffer in place; the
+/// host embeds the patches and normalises once before layer 0 and
+/// reads the residual stream (f32 on the device with `vit_res_f32`,
+/// else bf16) after layer 31. Over the runtime's parts rather than
+/// `&mut Sam3` so that `Sam3::segment` can run the text encoder on the
+/// store meanwhile.
+pub(crate) fn vit_device(
+    npu: &mut Npu,
+    io: &mut Ios,
+    w: &HashMap<String, Buffer>,
+    store: &Store,
+    cfg: &Config,
+    timing: &mut Timing,
+    pixels: &[f32],
+) -> Result<Vec<f32>, Error> {
+    {
+        let c = cfg;
         let (t, dim, g, ps, s) = (c.tokens(), c.vit_dim, c.grid, c.patch, c.image_size);
         if pixels.len() != 3 * s * s {
             return Err(Error::Input(format!("pixels must be [3, {s}, {s}]")));
         }
-        let perm = self.store.i32("v.perm")?.to_vec();
+        let perm = store.i32("v.perm")?.to_vec();
         let eps = c.vit_eps;
         let t0 = std::time::Instant::now();
 
         // patches (window order) -> embed GEMM -> + pos -> LN_pre: x0, then
         // the first LayerNorm (no affine: folded into qkv) of bf16(x0)
-        let ke = self.npu.spec("v_embed")?.k;
+        let ke = npu.spec("v_embed")?.k;
         let mut patches = vec![0u16; t * ke];
         par_rows(&mut patches, ke, |r0, piece| {
             for (ri, row) in piece.chunks_mut(ke).enumerate() {
@@ -205,10 +218,10 @@ impl Sam3 {
                 }
             }
         });
-        self.io.v_embed.set_a(&patches)?;
-        gemm(&mut self.npu, &self.io.v_embed, &self.w["v.embed"], &mut self.timing)?;
-        let emb = self.io.v_embed.get_c(t)?;
-        let st = &self.store;
+        io.v_embed.set_a(&patches)?;
+        gemm(npu, &io.v_embed, &w["v.embed"], timing)?;
+        let emb = io.v_embed.get_c(t)?;
+        let st = store;
         let pos = st.f32("v.pos")?;
         let (lw, lb) = (st.f32("v.ln_pre.w")?, st.f32("v.ln_pre.b")?);
         let ones = vec![1f32; dim];
@@ -244,41 +257,40 @@ impl Sam3 {
             }
         });
         if res_f32 {
-            push(&x0, &mut self.io.xres[0])?;
+            push(&x0, &mut io.xres[0])?;
         } else {
             let xb: Vec<u16> = x0.iter().map(|&v| f32_to_bf16(v)).collect();
-            push(&xb, &mut self.io.xres[0])?;
+            push(&xb, &mut io.xres[0])?;
         }
-        self.io.v_qkv.set_a(&h)?;
-        self.timing.add("vit_prologue", t0.elapsed());
+        io.v_qkv.set_a(&h)?;
+        timing.add("vit_prologue", t0.elapsed());
 
-        let rope_out = self.io.rope_out.as_ref().ok_or_else(|| Error::Bundle("no RoPE buffer".into()))?;
+        let rope_out = io.rope_out.as_ref().ok_or_else(|| Error::Bundle("no RoPE buffer".into()))?;
         for i in 0..c.vit_layers {
             let p = |n: &str| format!("v.{i}.{n}");
             let global = c.vit_global.contains(&i);
             let (tab, mha_key) = if global { ("v.rope_tab.glob", "mha_glob") } else { ("v.rope_tab.win", "mha_win") };
-            let io = &self.io;
-            gemm_dev(&mut self.npu, &io.v_qkv, &self.w[&p("qkv")], &mut self.timing)?;
-            op(&mut self.npu, "rope", &[&io.v_qkv.c, &self.w[tab], rope_out], &mut self.timing)?;
-            op(&mut self.npu, mha_key, &[rope_out, rope_out, &io.v_qkv.c, &io.v_o.a], &mut self.timing)?;
-            gemm_dev(&mut self.npu, &io.v_o, &self.w[&p("o")], &mut self.timing)?;
-            op(&mut self.npu, "addln", &[&io.xres[0], &io.v_o.c, &io.xres[1], &io.v_fc1.a], &mut self.timing)?;
-            gemm_dev(&mut self.npu, &io.v_fc1, &self.w[&p("fc1")], &mut self.timing)?;
-            gemm_dev(&mut self.npu, &io.v_fc2, &self.w[&p("fc2")], &mut self.timing)?;
-            op(&mut self.npu, "addln", &[&io.xres[1], &io.v_fc2.c, &io.xres[0], &io.v_qkv.a], &mut self.timing)?;
+            gemm_dev(npu, &io.v_qkv, &w[&p("qkv")], timing)?;
+            op(npu, "rope", &[&io.v_qkv.c, &w[tab], rope_out], timing)?;
+            op(npu, mha_key, &[rope_out, rope_out, &io.v_qkv.c, &io.v_o.a], timing)?;
+            gemm_dev(npu, &io.v_o, &w[&p("o")], timing)?;
+            op(npu, "addln", &[&io.xres[0], &io.v_o.c, &io.xres[1], &io.v_fc1.a], timing)?;
+            gemm_dev(npu, &io.v_fc1, &w[&p("fc1")], timing)?;
+            gemm_dev(npu, &io.v_fc2, &w[&p("fc2")], timing)?;
+            op(npu, "addln", &[&io.xres[1], &io.v_fc2.c, &io.xres[0], &io.v_qkv.a], timing)?;
         }
         let t1 = std::time::Instant::now();
         let xf: Vec<f32> = if c.vit_res_f32 {
-            pull(&self.io.xres[0], t * dim)?
+            pull(&io.xres[0], t * dim)?
         } else {
-            pull::<u16>(&self.io.xres[0], t * dim)?.into_iter().map(bf16_to_f32).collect()
+            pull::<u16>(&io.xres[0], t * dim)?.into_iter().map(bf16_to_f32).collect()
         };
         let mut out = vec![0f32; t * dim];
         for (j, row) in xf.chunks(dim).enumerate() {
             let r = perm[j] as usize;
             out[r * dim..(r + 1) * dim].copy_from_slice(row);
         }
-        self.timing.add("vit_readback", t1.elapsed());
+        timing.add("vit_readback", t1.elapsed());
         Ok(out)
     }
 }

@@ -236,10 +236,13 @@ impl Sam3 {
         out
     }
 
-    /// Box relative position bias `[H, 1 + Q, T]` (row 0, the presence
-    /// token's, zero): for each query box and grid row/column, the
-    /// log-scaled distances to the box's edges through a small MLP per axis.
-    fn rpb(&self, boxes: &[f32]) -> Result<Vec<f32>, Error> {
+    /// Box relative position bias in its separable form, `(by, bx)`, each
+    /// `[H, 1 + Q, g]` (row 0, the presence token's, zero): the bias of
+    /// query `q` at key `(iy, ix)` is `by[h, q, iy] + bx[h, q, ix]` -- for
+    /// each query box and grid row/column, the log-scaled distances to the
+    /// box's edges through a small MLP per axis. The `[H, 1 + Q, T]` sum is
+    /// never built; `cpu::attention_dec` adds the two terms on the way.
+    fn rpb(&self, boxes: &[f32]) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let c = &self.cfg;
         let (g, nh) = (c.grid, c.d_heads);
         let q = boxes.len() / 4;
@@ -262,25 +265,18 @@ impl Sam3 {
         };
         let ry = axis(1, "dec.rpb_y")?;
         let rx = axis(0, "dec.rpb_x")?;
-        let t = g * g;
-        let mut bias = vec![0f32; nh * (q + 1) * t];
-        par_rows(&mut bias, t, |r0, piece| {
-            for (ri, row) in piece.chunks_mut(t).enumerate() {
-                let r = r0 + ri;
-                let (h, qi) = (r / (q + 1), r % (q + 1));
-                if qi == 0 {
-                    continue;
-                }
-                let qq = qi - 1;
-                for iy in 0..g {
-                    let by = ry[(qq * g + iy) * nh + h];
-                    for ix in 0..g {
-                        row[iy * g + ix] = by + rx[(qq * g + ix) * nh + h];
-                    }
+        let lq = q + 1;
+        let (mut by, mut bx) = (vec![0f32; nh * lq * g], vec![0f32; nh * lq * g]);
+        for h in 0..nh {
+            for qq in 0..q {
+                let dst = (h * lq + qq + 1) * g;
+                for i in 0..g {
+                    by[dst + i] = ry[(qq * g + i) * nh + h];
+                    bx[dst + i] = rx[(qq * g + i) * nh + h];
                 }
             }
-        });
-        Ok(bias)
+        }
+        Ok((by, bx))
     }
 
     /// The DETR decoder + scoring: `enc [T, 256]` and the prompt ->
@@ -307,7 +303,8 @@ impl Sam3 {
         gemm(&mut self.npu, &self.io.dec_kv, &self.w["dec.kv"], &mut self.timing)?;
         let kv = self.io.dec_kv.get_c(t)?; // [T, layers x (K | V)] bf16
         let hd = d / nh;
-        let (mut kh, mut vh) = (vec![0f32; t * d], vec![0f32; t * d]); // [H, T, hd]
+        // this layer's keys transposed, [H, hd, T], and values, [H, T, hd]
+        let (mut kt, mut vh) = (vec![0f32; t * d], vec![0f32; t * d]);
 
         let st = &self.store;
         let mut refb: Vec<f32> = st.f32("dec.reference_points")?.iter().map(|&v| sigmoid(v)).collect();
@@ -324,14 +321,17 @@ impl Sam3 {
         let mut normed = vec![];
         for l in 0..c.dec_layers {
             let p = |s: &str| format!("dec.{l}.{s}");
+            let t0 = std::time::Instant::now();
             let sine = self.encode_boxes(&refb);
             let qpos_q = self.mlp(&sine, 2 * d, "dec.ref_point_head", 2)?;
             let mut qpos = vec![0f32; d];
             qpos.extend_from_slice(&qpos_q);
             let with_pos = |hs: &[f32]| -> Vec<f32> { hs.iter().zip(&qpos).map(|(a, b)| a + b).collect() };
+            self.timing.add("dec_qpos", t0.elapsed());
             let t0 = std::time::Instant::now();
-            let bias = self.rpb(&refb)?;
+            let (by, bx) = self.rpb(&refb)?;
             self.timing.add("dec_rpb", t0.elapsed());
+            let t0 = std::time::Instant::now();
 
             // self-attention (q, k with the query positions)
             let qk = with_pos(&hs);
@@ -343,6 +343,8 @@ impl Sam3 {
             let mut o = self.lin(&a, d, &p("sa.o"))?;
             cpu::add_(&mut o, &hs);
             hs = self.ln(&o, d, &p("sa_ln"))?;
+            self.timing.add("dec_sa", t0.elapsed());
+            let t0 = std::time::Instant::now();
 
             // text cross-attention
             let q = self.lin(&with_pos(&hs), d, &p("tca.q"))?;
@@ -353,25 +355,44 @@ impl Sam3 {
             let mut o = self.lin(&a, d, &p("tca.o"))?;
             cpu::add_(&mut o, &hs);
             hs = self.ln(&o, d, &p("tca_ln"))?;
+            self.timing.add("dec_tca", t0.elapsed());
 
             // vision cross-attention, with the box bias
             let q = self.lin(&with_pos(&hs), d, &p("vca.q"))?;
             let t0 = std::time::Instant::now();
-            for (dst, off) in [(&mut kh, l * 2 * d), (&mut vh, l * 2 * d + d)] {
-                par_rows(dst, hd, |r0, piece| {
-                    for (ri, row) in piece.chunks_mut(hd).enumerate() {
-                        let (h, j) = ((r0 + ri) / t, (r0 + ri) % t);
-                        for (o, &x) in row.iter_mut().zip(&kv[j * kvw + off + h * hd..][..hd]) {
-                            *o = bf16_to_f32(x);
+            let (koff, voff) = (l * 2 * d, l * 2 * d + d);
+            par_rows(&mut vh, hd, |r0, piece| {
+                for (ri, row) in piece.chunks_mut(hd).enumerate() {
+                    let (h, j) = ((r0 + ri) / t, (r0 + ri) % t);
+                    for (o, &x) in row.iter_mut().zip(&kv[j * kvw + voff + h * hd..][..hd]) {
+                        *o = bf16_to_f32(x);
+                    }
+                }
+            });
+            // the transpose in blocks of 8 key dimensions: one strided read
+            // of 8 bf16 per token, 8 sequential write streams
+            const KB: usize = 8;
+            par_rows(&mut kt, KB * t, |b0, piece| {
+                for (bi, blk) in piece.chunks_mut(KB * t).enumerate() {
+                    let (h, d0) = ((b0 + bi) / (hd / KB), ((b0 + bi) % (hd / KB)) * KB);
+                    for j in 0..t {
+                        let src = &kv[j * kvw + koff + h * hd + d0..][..KB];
+                        for (dd, &x) in src.iter().enumerate() {
+                            blk[dd * t + j] = bf16_to_f32(x);
                         }
                     }
-                });
-            }
-            let a = cpu::attention_hm(&q, d, nh, &kh, &vh, Some(&bias));
+                }
+            });
+            self.timing.add("dec_kvconv", t0.elapsed());
+            let t0 = std::time::Instant::now();
+            let a = cpu::attention_dec(&q, d, nh, &kt, &vh, &by, &bx, c.grid);
             self.timing.add("dec_vattn", t0.elapsed());
+            let t0 = std::time::Instant::now();
             let mut o = self.lin(&a, d, &p("vca.o"))?;
             cpu::add_(&mut o, &hs);
             hs = self.ln(&o, d, &p("vca_ln"))?;
+            self.timing.add("dec_vo", t0.elapsed());
+            let t0 = std::time::Instant::now();
 
             // MLP (post-norm)
             let mut f = self.lin(&hs, d, &p("fc1"))?;
@@ -379,6 +400,8 @@ impl Sam3 {
             let mut f = self.lin(&f, c.d_ffn, &p("fc2"))?;
             cpu::add_(&mut f, &hs);
             hs = self.ln(&f, d, &p("mlp_ln"))?;
+            self.timing.add("dec_mlp", t0.elapsed());
+            let t0 = std::time::Instant::now();
 
             // box refinement on the queries, presence from token 0
             normed = self.ln(&hs[d..], d, "dec.out_ln")?;
@@ -390,6 +413,7 @@ impl Sam3 {
             let pl = self.mlp(&pres, d, "dec.presence_head", 3)?[0].clamp(-10.0, 10.0);
             out.layer_boxes.push(refb.clone());
             out.layer_presence.push(pl);
+            self.timing.add("dec_heads", t0.elapsed());
         }
         out.presence = *out.layer_presence.last().unwrap();
         out.boxes = refb.chunks(4).flat_map(xyxy).collect();

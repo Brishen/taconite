@@ -11,8 +11,9 @@
 //! short prompt is a handful of tokens, so this is weight-bandwidth bound
 //! (the weights ship as bf16).
 
+use crate::bundle::Store;
 use crate::cpu::{self, Attn, Rows, W};
-use crate::{Error, Sam3};
+use crate::{Config, Error, Sam3};
 
 /// An encoded prompt: `feats [L, 256]` (L = 32), `valid [L]`.
 pub struct Text {
@@ -21,9 +22,17 @@ pub struct Text {
 }
 
 impl Sam3 {
-    pub fn text(&mut self, ids: &[u32], mask: &[u32]) -> Result<Text, Error> {
-        let st = &self.store;
-        let c = &self.cfg;
+    /// The CLIP text encoder over the tokens (`ids`, `mask` as the tokenizer
+    /// gives them) -> the prompt features `[L, 256]`.
+    pub fn text(&self, ids: &[u32], mask: &[u32]) -> Result<Text, Error> {
+        encode(&self.store, &self.cfg, ids, mask)
+    }
+}
+
+/// The text encoder over the bundle's weights alone (so it can run on a
+/// side thread while the ViT has the NPU).
+pub(crate) fn encode(st: &Store, c: &Config, ids: &[u32], mask: &[u32]) -> Result<Text, Error> {
+    {
         let (dim, l) = (c.text_dim, c.text_len);
         let n = mask.iter().take_while(|&&m| m != 0).count();
         if n == 0 || mask[n..].iter().any(|&m| m != 0) || ids.len() != l {
