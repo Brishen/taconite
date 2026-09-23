@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+max_width = 120
+use_small_heuristics = "Max"

@@ -4,10 +4,10 @@
 //! `gaic` — GAIC image cropping on the NPU, from an exported bundle.
 //!
 //!     gaic <bundle> check [--reps N] [--threads N]
-//!         Replays the bundle's reference image (ref/) and compares against
-//!         what the exporter recorded: the resize against PIL's, the
-//!         feature map and the scores against the f32 CPU reference and
-//!         the Python NPU path.
+//!         Replays the bundle's reference image (the `ref.*` tensors) and
+//!         compares against what the exporter recorded: the resize against
+//!         PIL's, the feature map and the scores against the f32 CPU
+//!         reference and the Python NPU path.
 //!     gaic <bundle> crop [--out DIR] [--reps N] [--threads N] IMAGE...
 //!         GAIC-Pytorch's demo: the best crop overall and at 1:1, 4:3 and
 //!         16:9, printed in source-image pixels (and written to DIR).
@@ -17,7 +17,6 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use gaic::anchors::{Box4, demo_sets, rescale_box};
-use gaic::bundle::read_f32;
 use gaic::{Gaic, preprocess};
 
 fn usage() -> ExitCode {
@@ -113,28 +112,28 @@ fn check(bundle: &Path, reps: usize, threads: Option<usize>) -> Res<bool> {
         g.set_threads(n);
     }
     println!("loaded {} in {:.2} s", bundle.display(), t0.elapsed().as_secs_f64());
-    let r = g.manifest().reference.clone().ok_or("the bundle has no ref record")?;
-    let dir = bundle.join("ref");
+    let r = g.bundle().reference.clone().ok_or("the bundle has no ref record")?;
+    // The references (sizes checked at load), copied out: `g` runs below.
+    let store = &g.bundle().store;
+    let f32s = |name: &str| store.f32(name).map(<[f32]>::to_vec);
+    let src = store.u8("ref.src_rgb")?.to_vec();
+    let x = f32s("ref.input_chw")?;
+    let anchors: Vec<[f32; 4]> = store
+        .i32("ref.anchors")?
+        .chunks_exact(4)
+        .map(|b| [b[0] as f32, b[1] as f32, b[2] as f32, b[3] as f32])
+        .collect();
+    let (red_cpu, red_npu) = (f32s("ref.red_cpu")?, f32s("ref.red_npu")?);
+    let (s_cpu, s_npu) = (f32s("ref.scores_cpu")?, f32s("ref.scores_npu")?);
     let mut ok = true;
 
     // The resize: PIL's decoded source through our Lanczos, against PIL's.
-    let src = std::fs::read(dir.join("src_rgb.u8"))?;
     let (x_rs, (w, h)) = preprocess::preprocess(&src, r.src_w, r.src_h);
-    let x = read_f32(&dir.join("input_chw.f32"))?;
     let diff = x_rs.iter().zip(&x).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     let exact = x_rs.iter().zip(&x).filter(|(a, b)| a == b).count();
     println!("resize {}x{} -> {w}x{h}: {exact}/{} values exact, max |diff| {diff:e}", r.src_w, r.src_h, x.len());
     ok &= (w, h) == (r.w, r.h) && diff < 1e-5;
 
-    let anchors: Vec<[f32; 4]> = std::fs::read(dir.join("anchors.i32"))?
-        .chunks_exact(16)
-        .map(|b| {
-            let v = |i: usize| i32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()) as f32;
-            [v(0), v(1), v(2), v(3)]
-        })
-        .collect();
-    let (red_cpu, red_npu) = (read_f32(&dir.join("red_cpu.f32"))?, read_f32(&dir.join("red_npu.f32"))?);
-    let (s_cpu, s_npu) = (read_f32(&dir.join("scores_cpu.f32"))?, read_f32(&dir.join("scores_npu.f32"))?);
     for rep in 0..reps.max(1) {
         g.reset_timing();
         let t = Instant::now();

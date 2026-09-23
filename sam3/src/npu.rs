@@ -117,10 +117,15 @@ impl Npu {
         let mut sources = HashMap::new();
         let mut order = vec![];
         for g in m.gemms.values() {
-            let (xclbin, name) = &m.xclbins[&g.ctx];
+            let x = m.xclbin(&g.ctx)?;
             let ops = (2 * g.m * g.k * g.n) as u64;
-            let s =
-                Source { ctx: g.ctx.clone(), xclbin: xclbin.clone(), insts: g.insts.clone(), name: name.clone(), ops };
+            let s = Source {
+                ctx: g.ctx.clone(),
+                xclbin: x.path.clone(),
+                insts: g.insts.clone(),
+                name: x.kernel.clone(),
+                ops,
+            };
             sources.insert(g.key.clone(), s);
             order.push(g.key.clone());
         }
