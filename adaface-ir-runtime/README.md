@@ -5,10 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # adaface-ir-runtime
 
-An **embeddable**, zero-dependency Rust library that runs AdaFace IR face
-embedders (IR-18, IR-101) on the AIE NPU with no Python at inference time.
-It replays a *bundle* — compiled conv kernels, packed weights, and a flat
-op plan — exported ahead of time by
+An **embeddable** Rust library, with no crates.io dependencies, that runs
+AdaFace IR face embedders (IR-18, IR-101) on the AIE NPU with no Python at
+inference time. It replays a *bundle* — compiled conv kernels, packed
+weights, and the network's steps in order, in the format every IRON bundle
+shares (read with the in-repo, std-only `iron/rust/iron-bundle`) — exported
+ahead of time by
 `iron/applications/adaface_ir18/export_ir18.py` /
 `iron/applications/adaface_ir101/export_ir101.py` (iron acts purely as an
 AOT compiler). The `run_ir18` / `run_ir101` binaries under the app
@@ -46,9 +48,11 @@ bad bundles, or exits the host process.
 
 ### Performance model
 
-The first `embed()` creates one XRT hardware context per distinct conv
-kernel (16 for IR-18/IR-101 — exactly the NPU2's concurrent-context cap) and
-loads weights from disk; the session keeps all of it resident, so **every
+`IrEmbedder::load` reads every weight into RAM and checks every step against
+them (a malformed bundle fails here, naming the manifest line). The first
+`embed()` creates one XRT hardware context per distinct conv kernel (16 for
+IR-18/IR-101 — exactly the NPU2's concurrent-context cap); the session keeps
+them all resident, so **every
 later forward reloads nothing** (measured: IR-18 ~0.15 s, IR-101 ~0.31 s
 warm). This is the whole point of the runtime — so:
 
@@ -66,7 +70,8 @@ close; `IRON_XRT_CTX_CACHE` overrides the resident-context cap (default 16).
 - **XRT** headers/libs at `$XRT_ROOT` (default `/opt/xilinx/xrt`) and `g++`
   at build time: this crate's `build.rs` compiles the bundled C++ shim
   (`iron_xrt_shim.cpp`, one `xrt::hw_context` LRU) and links
-  `libxrt_coreutil`. No cargo crates at all, so it builds offline.
+  `libxrt_coreutil`. No crates.io dependencies (only the in-repo
+  `iron-bundle`), so it builds offline.
 - At link time the flags propagate to your binary automatically. The
   **rpath does not** (cargo drops `rustc-link-arg` across crates): either
   run with XRT's `setup.sh` sourced (`LD_LIBRARY_PATH`), or emit the rpaths
@@ -85,9 +90,10 @@ close; `IRON_XRT_CTX_CACHE` overrides the resident-context cap (default 16).
   ```
 
 - At run time: the NPU device (`/dev/accel/accel0`, amdxdna driver) and the
-  bundle directory. The bundle is plain data (~10 MB of xclbins/insts plus
-  the bf16 weights — ~25 MB for IR-18, ~130 MB for IR-101); ship it next to
-  your binary and pass its path to `IrEmbedder::load`.
+  bundle directory. The bundle is plain data — `manifest.txt`, `kernels/`
+  (~10 MB of xclbins/insts) and `tensors.bin` (the weights and reference
+  tensors; 47 MB in all for IR-18, 126 MB for IR-101); ship it next to your
+  binary and pass its path to `IrEmbedder::load`.
 
 ### Portable deployment (no XRT install on the target)
 
@@ -125,20 +131,20 @@ basics (glibc, `libstdc++`, `libuuid`).
 
 | item | purpose |
 |---|---|
-| `IrEmbedder::load(dir)` | parse `plan.txt`, open the NPU device |
+| `IrEmbedder::load(dir)` | read and check the bundle, open the NPU device |
 | `embed(&mut self, chw: &[f32])` | embed a caller image (pads channels, rounds to bf16 round-to-nearest-even — bit-identical to torch) |
 | `embed_recorded(&mut self)` | replay the bundle's recorded input (self-check / benchmark) |
-| `input_dims() / embed_dim() / num_conv_dispatches()` | plan properties |
+| `input_dims() / embed_dim() / model() / num_conv_dispatches()` | bundle properties |
 | `cosine(a, b)` | embedding similarity |
 | `cli(net_name)` | the whole `run_ir*` CLI, built on the API above |
 | `Error` | `Io` / `Plan` / `Xrt` / `Input` |
 
 ## Correctness
 
-The exporter records the plan by *running* the Python NPU implementation, so
-the plan and Python share numerics; `expected.bin` (recorder embedding) and
-`ref.bin` (fp32 CPU reference) ride along in the bundle, and the CLI checks
-both every run. `input_chw.bin` (the raw f32 input) additionally routes
+The exporter records the steps by *running* the Python NPU implementation, so
+the steps and Python share numerics; `ref.npu_embedding` (recorder embedding)
+and `ref.cpu_embedding` (fp32 CPU reference) ride along in the bundle, and the
+CLI checks both every run. `ref.input_chw` (the raw f32 input) additionally routes
 through the public `embed()` API — its pad + round + tile path reproduces
 the recorded replay bit-for-bit (verified cosine 1.00000 on NPU2 for both
 IR-18 and IR-101; cosine vs the fp32 reference is 0.9993 / 0.9974).
