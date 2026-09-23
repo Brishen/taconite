@@ -175,7 +175,8 @@ impl Sam3 {
     ///
     /// each kernel reading the previous one's output buffer in place; the
     /// host embeds the patches and normalises once before layer 0 and
-    /// reads the residual stream (bf16 on the device) after layer 31.
+    /// reads the residual stream (f32 on the device with `vit_res_f32`,
+    /// else bf16) after layer 31.
     fn vit_device(&mut self, pixels: &[f32]) -> Result<Vec<f32>, Error> {
         let c = self.cfg.clone();
         let (t, dim, g, ps, s) = (c.tokens(), c.vit_dim, c.grid, c.patch, c.image_size);
@@ -212,37 +213,42 @@ impl Sam3 {
         let (lw, lb) = (st.f32("v.ln_pre.w")?, st.f32("v.ln_pre.b")?);
         let ones = vec![1f32; dim];
         let zeros = vec![0f32; dim];
-        let mut x0 = vec![0u16; t * dim];
+        // the residual stream's first value: f32, or rounded to bf16 when the
+        // device keeps the stream in bf16 (then h is the LayerNorm of that)
+        let res_f32 = c.vit_res_f32;
+        let mut x0 = vec![0f32; t * dim];
         let mut h = vec![0u16; t * dim];
         par_rows(&mut x0, dim, |r0, piece| {
             let mut tmp = vec![0f32; dim];
-            let mut out = vec![0f32; dim];
             for (ri, row) in piece.chunks_mut(dim).enumerate() {
                 let r = r0 + ri;
                 for j in 0..dim {
                     tmp[j] = bf16_to_f32(emb[r * dim + j]) + pos[r * dim + j];
                 }
-                ln_row(&tmp, &mut out, lw, lb, eps);
-                for (o, v) in row.iter_mut().zip(&out) {
-                    *o = f32_to_bf16(*v);
+                ln_row(&tmp, row, lw, lb, eps);
+                if !res_f32 {
+                    for v in row.iter_mut() {
+                        *v = bf16_to_f32(f32_to_bf16(*v));
+                    }
                 }
             }
         });
         par_rows(&mut h, dim, |r0, piece| {
-            let mut xr = vec![0f32; dim];
             let mut out = vec![0f32; dim];
             for (ri, row) in piece.chunks_mut(dim).enumerate() {
                 let r = r0 + ri;
-                for j in 0..dim {
-                    xr[j] = bf16_to_f32(x0[r * dim + j]);
-                }
-                ln_row(&xr, &mut out, &ones, &zeros, eps);
+                ln_row(&x0[r * dim..(r + 1) * dim], &mut out, &ones, &zeros, eps);
                 for (o, v) in row.iter_mut().zip(&out) {
                     *o = f32_to_bf16(*v);
                 }
             }
         });
-        push(&x0, &mut self.io.xres[0])?;
+        if res_f32 {
+            push(&x0, &mut self.io.xres[0])?;
+        } else {
+            let xb: Vec<u16> = x0.iter().map(|&v| f32_to_bf16(v)).collect();
+            push(&xb, &mut self.io.xres[0])?;
+        }
         self.io.v_qkv.set_a(&h)?;
         self.timing.add("vit_prologue", t0.elapsed());
 
@@ -262,13 +268,15 @@ impl Sam3 {
             op(&mut self.npu, "addln", &[&io.xres[1], &io.v_fc2.c, &io.xres[0], &io.v_qkv.a], &mut self.timing)?;
         }
         let t1 = std::time::Instant::now();
-        let xb = pull(&self.io.xres[0], t * dim)?;
+        let xf: Vec<f32> = if c.vit_res_f32 {
+            pull(&self.io.xres[0], t * dim)?
+        } else {
+            pull::<u16>(&self.io.xres[0], t * dim)?.into_iter().map(bf16_to_f32).collect()
+        };
         let mut out = vec![0f32; t * dim];
-        for (j, row) in xb.chunks(dim).enumerate() {
+        for (j, row) in xf.chunks(dim).enumerate() {
             let r = perm[j] as usize;
-            for (o, &v) in out[r * dim..(r + 1) * dim].iter_mut().zip(row) {
-                *o = bf16_to_f32(v);
-            }
+            out[r * dim..(r + 1) * dim].copy_from_slice(row);
         }
         self.timing.add("vit_readback", t1.elapsed());
         Ok(out)
