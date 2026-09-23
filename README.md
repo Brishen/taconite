@@ -61,6 +61,6 @@ are tested on NPU2 (Strix).
 
 ## License
 
-Apache-2.0. Some model crates also include ported code under MIT, MIT-CMU
+Apache-2.0 ([`LICENSE`](LICENSE); each crate ships a copy). Some model crates also include ported code under MIT, MIT-CMU
 or BSD-3-Clause. Each crate's `Cargo.toml` `license` field and its
 `LICENSE-*` files give the exact terms.
