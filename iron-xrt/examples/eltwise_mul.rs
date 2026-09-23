@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
 //! Builds an IRON element-wise multiply from source and runs it: the kernel

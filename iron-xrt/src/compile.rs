@@ -1,4 +1,5 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+// SPDX-FileCopyrightText: Copyright (c) 2026 Eugene Hauptmann, Nataliya Kosmyna (RLX)
 // SPDX-License-Identifier: Apache-2.0
 
 //! Building IRON kernels from Rust, with no Python: the two compile steps

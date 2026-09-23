@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+/* SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
  * SPDX-License-Identifier: Apache-2.0 */
 /* Linker --dynamic-list for a binary that links libxrt_coreutil.a (see
  * build.rs, "static"): every XRT symbol the executable carries goes into
