@@ -1,0 +1,26 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0 */
+/* Linker --dynamic-list for a binary that links libxrt_coreutil.a (see
+ * build.rs, "static"): every XRT symbol the executable carries goes into
+ * its dynamic symbol table, so libxrt_core.so.2 and the amdxdna driver
+ * plug-in coreutil dlopens at run time bind to the executable's copy of
+ * coreutil rather than to the libxrt_coreutil.so.2 they name as a
+ * dependency (which still loads, but stays inert). Without this the
+ * plug-ins register the device with the shared copy and the executable's
+ * copy reports "system singleton is not loaded".
+ *
+ * Itanium C++ mangling: _ZN<len><name>… is namespace xrt (3) / xrt_core
+ * (8); _ZNK the const-member variants; _ZTV/_ZTI/_ZTS vtables, typeinfo
+ * and typeinfo names (exceptions thrown in a plug-in have to match the
+ * catch in iron_xrt_shim.cpp); _ZTh/_ZTv this-adjusting thunks; _ZZ/_ZGVZ
+ * function-local statics and their guards (XRT's singletons live there).
+ * The unmangled names (xrt…, xcl…) are the C API. */
+{
+  _ZN3xrt*; _ZNK3xrt*; _ZN8xrt_core*; _ZNK8xrt_core*;
+  _ZTVN3xrt*; _ZTIN3xrt*; _ZTSN3xrt*;
+  _ZTVN8xrt_core*; _ZTIN8xrt_core*; _ZTSN8xrt_core*;
+  _ZTh*N3xrt*; _ZTv*N3xrt*; _ZTh*N8xrt_core*; _ZTv*N8xrt_core*;
+  _ZZN3xrt*; _ZZN8xrt_core*; _ZGVZN3xrt*; _ZGVZN8xrt_core*;
+  _ZN6xclbin*; _ZNK6xclbin*;
+  xrt*; xcl*;
+};

@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "iron-xrt"
+version = "0.1.0"
+edition = "2024"
+description = "Replays IRON (mlir-aie) kernels on an AMD XDNA NPU through XRT, with no Python at run time"
+# Lets a dependent's build script read `DEP_IRONXRT_LIBDIR` (see build.rs):
+# `cargo:rustc-link-arg` does not propagate across crates, so a binary that
+# wants XRT's lib dir on its rpath has to re-emit it.
+links = "ironxrt"
+
+# Deliberately no dependencies: build.rs drives g++/ar itself (no `cc`
+# crate) so the crate builds offline, and the API is plain `std`.
+[dependencies]
