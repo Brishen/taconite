@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "SAM3 (Segment Anything 3) text-prompted segmentation on an AMD XDNA NPU: IRON kernels replayed through XRT, no Python"
-license = "Apache-2.0"
+license = "Apache-2.0 AND BSD-3-Clause AND MIT-CMU"
 readme = "README.md"
 keywords = ["npu", "xdna", "sam3", "segmentation", "amd"]
 categories = ["computer-vision", "science", "command-line-utilities"]

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
 //! `flm.GEMM`'s B packing (`iron/operators/flm/packing.py`), for the weights

@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 SPDX-License-Identifier: Apache-2.0
 -->
 
@@ -109,3 +109,10 @@ NPU2 (Ryzen AI 9 HX 370), 384×256 input, warm, 8 host threads:
 
 These were measured while other jobs shared the CPU. Under heavy host load,
 the glue stages stretch several-fold.
+
+## License
+
+Apache-2.0, except two ports: `src/align.rs` and `src/anchors.rs` port
+[GAIC-Pytorch](https://github.com/bo-zhang-cs/GAIC-Pytorch)'s RoI/RoD align
+kernels and candidate generation (MIT, `LICENSE-GAIC-PYTORCH`), and
+`src/preprocess.rs` ports Pillow's resampler (MIT-CMU, `LICENSE-PILLOW`).

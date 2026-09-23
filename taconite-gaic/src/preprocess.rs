@@ -1,5 +1,11 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+// SPDX-FileCopyrightText: Copyright © 1997-2011 by Secret Labs AB
+// SPDX-FileCopyrightText: Copyright © 1995-2011 by Fredrik Lundh and contributors
+// SPDX-FileCopyrightText: Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
+// SPDX-License-Identifier: Apache-2.0 AND MIT-CMU
+//
+// The resampler ports Pillow's (libImaging/Resample.c), MIT-CMU; its notice
+// is in LICENSE-PILLOW.
 
 //! The network input, as GAIC-Pytorch's demo.py makes it: resize (short
 //! side 256, each side rounded to a multiple of 32) with PIL's LANCZOS

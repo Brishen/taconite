@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 SPDX-License-Identifier: Apache-2.0
 -->
 
@@ -134,3 +134,10 @@ prints the same numbers as the XRT build, at the same speed (~2.6 s a case).
   tracking model are not ported.
 - Prompts are NFC-normalised by HF's tokenizer; this one assumes composed
   input (std has no Unicode normalisation).
+
+## License
+
+Apache-2.0, except `src/post.rs`, whose resampler ports torch's
+antialiased uint8 resize (BSD-3-Clause, `LICENSE-PYTORCH`), itself after
+Pillow's (MIT-CMU, `LICENSE-PILLOW`). `src/pack.rs` ports IRON's
+`flm.GEMM` packer (Apache-2.0, AMD).

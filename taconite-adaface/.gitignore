@@ -1,2 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+# SPDX-License-Identifier: Apache-2.0
+
 /target
 Cargo.lock

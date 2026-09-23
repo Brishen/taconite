@@ -1,5 +1,14 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+// SPDX-FileCopyrightText: The PyTorch authors (see LICENSE-PYTORCH)
+// SPDX-FileCopyrightText: Copyright © 1997-2011 by Secret Labs AB
+// SPDX-FileCopyrightText: Copyright © 1995-2011 by Fredrik Lundh and contributors
+// SPDX-FileCopyrightText: Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
+// SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause AND MIT-CMU
+//
+// The resampler ports torch's antialiased uint8 resize
+// (aten/src/ATen/native/cpu/UpSampleKernel.cpp), BSD-3-Clause, which
+// follows Pillow's (libImaging/Resample.c), MIT-CMU; their notices are in
+// LICENSE-PYTORCH and LICENSE-PILLOW.
 
 //! Pre- and post-processing, as HF's `Sam3ImageProcessor`:
 //!

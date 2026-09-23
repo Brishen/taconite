@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 SPDX-License-Identifier: Apache-2.0
 -->
 
@@ -115,3 +115,9 @@ the records `export_clip.py`'s docstring lists.
   request still runs the full pass.
 - The tokenizer and host math come from the `taconite-sam3` crate; a shared
   runtime-helpers crate would be the cleaner home.
+
+## License
+
+Apache-2.0, except `src/preprocess.rs`, whose resampler ports torch's
+antialiased uint8 resize (BSD-3-Clause, `LICENSE-PYTORCH`), itself after
+Pillow's (MIT-CMU, `LICENSE-PILLOW`).

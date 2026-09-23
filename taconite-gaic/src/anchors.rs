@@ -1,5 +1,9 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+// SPDX-FileCopyrightText: Copyright (c) 2022 bo-zhang
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+//
+// Ports GAIC-Pytorch (https://github.com/bo-zhang-cs/GAIC-Pytorch), MIT;
+// its notice is in LICENSE-GAIC-PYTORCH.
 
 //! Candidate crops, as GAIC-Pytorch's dataset/candidate_generation.py makes
 //! them (same f64 arithmetic, same truncating `int()`), in the network

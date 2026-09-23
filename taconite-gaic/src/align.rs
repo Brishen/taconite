@@ -1,5 +1,9 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+// SPDX-FileCopyrightText: Copyright (c) 2022 bo-zhang
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+//
+// Ports GAIC-Pytorch (https://github.com/bo-zhang-cs/GAIC-Pytorch), MIT;
+// its notice is in LICENSE-GAIC-PYTORCH.
 
 //! RoIAlignAvg / RoDAlignAvg: ports of GAIC-Pytorch's CPU kernels
 //! (untils/{roi,rod}_align/src/*.cpp, forward) followed by the 2x2 stride-1
