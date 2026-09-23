@@ -22,6 +22,9 @@
 //! syncs around a run, so activations never take an extra copy on the way
 //! to or from the array.
 //!
+//! The [`compile`] module builds those kernels, too — Peano and the native
+//! `aiecc` as subprocesses, still no Python — from a design's MLIR.
+//!
 //! Everything returns [`Result`]; the shim never prints or aborts. The
 //! XRT objects may move between threads but not be shared by them, so a
 //! `Session` and what it owns are `Send` and not `Sync`: a model loads on
@@ -34,6 +37,8 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
+
+pub mod compile;
 
 mod ffi {
     use super::*;
@@ -113,6 +118,8 @@ pub enum Error {
     Run(String),
     /// A path contained an interior NUL.
     Path(String),
+    /// A kernel or design failed to build (see [`compile`]).
+    Compile(String),
 }
 
 impl fmt::Display for Error {
@@ -123,6 +130,7 @@ impl fmt::Display for Error {
             Error::Buffer(m) => write!(f, "NPU buffer: {m}"),
             Error::Run(m) => write!(f, "NPU run: {m}"),
             Error::Path(m) => write!(f, "path: {m}"),
+            Error::Compile(m) => write!(f, "compile: {m}"),
         }
     }
 }

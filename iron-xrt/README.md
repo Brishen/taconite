@@ -27,3 +27,39 @@ three types:
 `$XRT_ROOT` (default `/opt/xilinx/xrt`). It publishes `DEP_IRONXRT_DYNLIST` /
 `DEP_IRONXRT_LIBDIR` for dependents to re-emit; see `gaic/build.rs`. Building
 also needs XRT's headers and `uuid/uuid.h`.
+
+## Building kernels: `compile`
+
+`iron_xrt::compile` builds the kernels too, still without Python. It runs
+the two tools IRON's Python drives as subprocesses, with the flags IRON and
+mlir-aie pass them:
+
+- **`Toolchain::compile_kernel`**: compiles an AIE kernel (`aie_kernels/…/*.cc`)
+  to an object with Peano's `clang++`, for `Arch::Aie2` (NPU1) or
+  `Arch::Aie2p` (NPU2).
+- **`Toolchain::compile_design`**: compiles a design's MLIR (what `design.py`
+  generates) to the `.xclbin` + instruction stream that `load_kernel` takes,
+  with the native `aiecc` binary. It links the design's `link_with` objects.
+
+```rust
+use iron_xrt::compile::{Arch, Design, KernelSource, Toolchain};
+
+let tc = Toolchain::from_env()?; // $MLIR_AIE_INSTALL_DIR (+ $PEANO_INSTALL_DIR, $AIECC_PATH)
+tc.compile_kernel(&KernelSource::new("aie_kernels/generic/mul.cc", Arch::Aie2p), "out/mul.o".as_ref())?;
+tc.compile_design(&Design::new("mul.mlir", "out/work").link("out/mul.o"),
+                  "out/mul.xclbin".as_ref(), "out/mul.insts.bin".as_ref())?;
+```
+
+aiecc packages the xclbin with XRT's `xclbinutil`, so that must be on its
+`PATH`. mlir-aie's binaries are built for a generic Linux. On NixOS they run
+in the IRON container instead: `Toolchain::with_launcher` prefixes every tool
+invocation with a command, for example a script that runs
+`podman run … --entrypoint "$1" <image> "${@:2}"` with the same paths mounted.
+
+`examples/eltwise_mul.rs` goes from source to NPU. It builds `mul.cc` and an
+`ElementwiseMul` design MLIR, runs the result, and checks it against the
+CPU. Built this way, the object and the instruction stream are byte-identical
+to IRON's. The xclbin differs only in its timestamps and UUIDs.
+
+Adapted from [RLX](https://github.com/MIT-RLX/rlx)'s `rlx-xdna` `compile.rs`
+(MIT OR Apache-2.0).
