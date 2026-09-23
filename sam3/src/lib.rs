@@ -12,7 +12,7 @@
 //! | stage | NPU | host (here) |
 //! |---|---|---|
 //! | CLIP text encoder | | all of it (`text.rs`) |
-//! | ViT backbone, 32 layers | patch embed, every Linear, attention, MLP GELU | LayerNorms, RoPE, residuals (`vit.rs`) |
+//! | ViT backbone, 32 layers | all of it: patch embed, Linears, RoPE, attention, GELU, residual adds + LayerNorms | the first LayerNorm, once (`vit.rs`) |
 //! | FPN neck | ConvTs, 1x1s, 3x3s | GELU, pixel shuffles (`neck.rs`) |
 //! | DETR encoder, 6 layers | projections, self-attention, folded prompt cross-attention, MLP | LayerNorms, prompt softmax (`detr.rs`) |
 //! | DETR decoder, 6 layers | all six layers' vision keys/values (one GEMM) | the 201-query layers, box refinement, scoring (`detr.rs`) |
@@ -144,6 +144,9 @@ pub struct Config {
     pub dec_layers: usize,
     pub neck_splits: Vec<usize>,
     pub mask_size: usize,
+    /// every ViT layer on the device (RoPE, LayerNorms, residual adds);
+    /// bundles from before it host that glue
+    pub vit_device: bool,
 }
 
 impl Config {
@@ -173,6 +176,7 @@ impl Config {
             dec_layers: m.usize("dec_layers")?,
             neck_splits: m.list("neck_splits")?,
             mask_size: m.usize("mask_size")?,
+            vit_device: m.params.get("vit_device").is_some_and(|v| v == "1"),
         })
     }
 
@@ -216,6 +220,10 @@ struct Ios {
     mha_d: MhaIo,
     dec_kv: Io,
     m_head: Io,
+    /// device-resident ViT: RoPE output `[T, 2 D]`, the residual stream's
+    /// two ping-pong buffers `[T, D]`
+    rope_out: Option<Buffer>,
+    xres: Vec<Buffer>,
 }
 
 pub struct Sam3 {
@@ -265,8 +273,12 @@ impl Sam3 {
         for i in 0..2 {
             names.push(format!("m.conv{i}"));
         }
+        if cfg.vit_device {
+            names.push("v.rope_tab.win".into());
+            names.push("v.rope_tab.glob".into());
+        }
         for n in names {
-            let b = npu.upload(store.u8(&n)?)?;
+            let b = npu.upload(store.bytes(&n)?)?;
             w.insert(n, b);
         }
         let mut slots = HashMap::new();
@@ -308,6 +320,12 @@ impl Sam3 {
             mha_d: npu.mha_io("mha_d")?,
             dec_kv: npu.io("dec_kv", t)?,
             m_head: npu.io("m_head", s * s)?,
+            rope_out: if cfg.vit_device { Some(npu.session.alloc(t * 2 * cfg.vit_dim * 2)?) } else { None },
+            xres: if cfg.vit_device {
+                vec![npu.session.alloc(t * cfg.vit_dim * 2)?, npu.session.alloc(t * cfg.vit_dim * 2)?]
+            } else {
+                vec![]
+            },
         };
         Ok(Sam3 { manifest, store, cfg, tokenizer, npu, w, slots, io, timing: Timing::default() })
     }
@@ -351,6 +369,20 @@ impl Sam3 {
 fn gemm(npu: &mut Npu, io: &Io, w: &Buffer, timing: &mut Timing) -> Result<(), Error> {
     let d = npu.run_synced(io, w)?;
     timing.add(&format!("npu:{}", io.key), d);
+    Ok(())
+}
+
+/// Runs GEMM `io` whose A another kernel wrote (no host sync).
+fn gemm_dev(npu: &mut Npu, io: &Io, w: &Buffer, timing: &mut Timing) -> Result<(), Error> {
+    let d = npu.run(io, w)?;
+    timing.add(&format!("npu:{}", io.key), d);
+    Ok(())
+}
+
+/// Runs kernel `key` over device-resident `args`.
+fn op(npu: &mut Npu, key: &str, args: &[&Buffer], timing: &mut Timing) -> Result<(), Error> {
+    let d = npu.run_args(key, args)?;
+    timing.add(&format!("npu:{key}"), d);
     Ok(())
 }
 

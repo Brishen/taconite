@@ -27,14 +27,14 @@ sam3 check <bundle>          # every stage against the float32 reference
 |---|---|---|
 | preprocessing | | resize to 1008 x 1008 (torch's antialiased uint8 bilinear, bit-exact), normalise (`post.rs`) |
 | CLIP tokenizer + text encoder (24 layers) | | byte-level BPE (`tokenizer.rs`); the encoder over the valid tokens only (`text.rs`) |
-| ViT backbone (32 layers, 5184 tokens) | patch embedding, every Linear, windowed + global attention, the MLP's GELU | LayerNorms, RoPE, residuals (`vit.rs`) |
+| ViT backbone (32 layers, 5184 tokens) | everything: patch embedding, every Linear, RoPE, windowed + global attention, GELU, residual adds + LayerNorms — each kernel reading the last one's output in place | the first LayerNorm and the readback, once (`vit.rs`) |
 | FPN neck | ConvTs, 1x1s and 3x3 convs as GEMMs | GELU, pixel shuffles (`neck.rs`) |
 | DETR encoder (6 layers) | projections, self-attention, the prompt cross-attention folded into two GEMMs, the MLP | LayerNorms, the softmax over the prompt, folding + packing its weights per prompt (`detr.rs`) |
 | DETR decoder (6 layers, 200 queries) | every layer's vision keys and values, in one GEMM | the query layers, box relative-position bias, box refinement, presence, scoring (`detr.rs`) |
 | mask decoder | prompt cross-attention, the pixel decoder's 3x3s, the mask + semantic head folded into one GEMM | GroupNorms, upsampling, folding + packing the head per forward (`mask.rs`) |
 | post-processing | | score gating, box scaling, mask upsampling (`post.rs`) |
 
-19 kernels on 13 hardware contexts. Weights the runtime builds per prompt
+21 kernels on 15 hardware contexts (NPU2 has 16). Weights the runtime builds per prompt
 (the folded cross-attentions, the mask head) are packed here into
 `flm.GEMM`'s bfp16ebs8 layout (`pack.rs`, byte-identical to the Python
 packer).
@@ -54,7 +54,7 @@ host pieces:
   [info] image decoding: 12593 of 921600 bytes differ from PIL's; after resize max 3.0 levels
 stages, each on the float32 reference's inputs:
   [ok] text encoder: cosine 1.000000
-  [ok] ViT backbone: cosine 0.985139
+  [ok] ViT backbone: cosine 0.983623
   [ok] neck level 0 / 1 / 2: cosine 0.999961 / 0.999953 / 0.999968
   [ok] DETR encoder: cosine 0.999722
   [ok] DETR decoder hidden: cosine 0.999831
@@ -78,23 +78,21 @@ not in which instances are found.
 ## Performance
 
 Warm, one image + prompt, image file to instances, Ryzen AI 9 HX 370
-(quiet machine): **~3.0–3.4 s**, of which ~1.5 s is NPU execution:
+(quiet machine): **~2.5–2.6 s**, of which ~1.8 s is NPU execution:
 
 ```
-text 67  vit 1869 (host glue around attention 394)  neck 108  detr_enc 317
-detr_dec 431 (vision attention 180, box bias 78)  mask_dec 168  ms
-npu 1474 ms: v_qkv 184 mha_win 156 v_o 119 v_fc1 382 v_fc2 179 mha_glob 169 ...
+text 72  vit 1493 (prologue 13, readback 3; the rest NPU)  neck 101
+detr_enc 297  detr_dec ~400  mask_dec ~170  ms
 ```
 
-That is on par with the Python app on the same machine (2.9–3.5 s, model
-forward only): both are bound by the same NPU work and the ViT's
-host <-> NPU traffic around attention (RoPE between the qkv GEMM and the
-MHA). What the Rust runtime adds is no Python, torch or transformers at
-run time, a one-second start from the bundle, and sharing the NPU: the
-bundle's 13 contexts stay resident when they fit, and when another process
-holds some of NPU2's 16 the runtime evicts its least recently used context
-to load the next (`SAM3_MAX_CONTEXTS=n` caps it; at 4 a forward costs
-~0.4 s more).
+The ViT's layers run entirely on the device (bundles with `vit_device`):
+RoPE, the residual adds and the LayerNorms are NPU kernels too, and each
+kernel reads the previous one's output buffer in place, so a layer never
+touches the host. The ViT is now NPU-bound; the CPU's share is the
+DETR decoder's query layers (~0.4 s) and the text encoder. The bundle's
+15 contexts stay resident when they fit, and when another process holds
+some of NPU2's 16 the runtime evicts its least recently used context to
+load the next (`SAM3_MAX_CONTEXTS=n` caps it).
 
 Host buffers of the NPU are touched only through bulk parallel copies
 (`npu::push` / `pull`); stages compute in ordinary memory.

@@ -5,7 +5,8 @@
 //! `iron/applications/sam3/sam3_npu.py`'s `NpuViT`: tokens in window order
 //! for the whole backbone, q/k head dims in half-split order (both baked
 //! into the exported weights and tables), every Linear and the attention on
-//! the NPU, LayerNorms / RoPE / residuals here. The patch embedding (a
+//! the NPU, LayerNorms / RoPE / residuals here -- or, for bundles with
+//! `vit_device`, those on the NPU too (`vit_device`). The patch embedding (a
 //! 14 x 14 stride-14 conv) is a GEMM over the patches too (K = 588 padded
 //! to 768).
 //!
@@ -17,12 +18,15 @@ use iron_xrt::{bf16_to_f32, f32_to_bf16};
 
 use crate::cpu::{ln_row, par_rows};
 use crate::npu::{pull, push};
-use crate::{Error, Sam3, gemm, mha};
+use crate::{Error, Sam3, gemm, gemm_dev, mha, op};
 
 impl Sam3 {
     /// `pixels [3, S, S]` -> the backbone's last hidden state `[T, 1024]`,
     /// raster order.
     pub fn vit(&mut self, pixels: &[f32]) -> Result<Vec<f32>, Error> {
+        if self.cfg.vit_device {
+            return self.vit_device(pixels);
+        }
         let c = self.cfg.clone();
         let (t, dim, g, ps, s) = (c.tokens(), c.vit_dim, c.grid, c.patch, c.image_size);
         if pixels.len() != 3 * s * s {
@@ -157,6 +161,116 @@ impl Sam3 {
             let r = perm[j] as usize;
             out[r * dim..(r + 1) * dim].copy_from_slice(row);
         }
+        Ok(out)
+    }
+}
+
+impl Sam3 {
+    /// The backbone with every layer on the device (bundles with
+    /// `vit_device`, `iron/applications/sam3/sam3_npu.py`'s
+    /// `_forward_device`): per layer
+    ///
+    ///   qkv GEMM -> RoPE(q | k) -> MHA -> o GEMM -> AddLN(+o) -> fc1 ->
+    ///   fc2 -> AddLN(+fc2)
+    ///
+    /// each kernel reading the previous one's output buffer in place; the
+    /// host embeds the patches and normalises once before layer 0 and
+    /// reads the residual stream (bf16 on the device) after layer 31.
+    fn vit_device(&mut self, pixels: &[f32]) -> Result<Vec<f32>, Error> {
+        let c = self.cfg.clone();
+        let (t, dim, g, ps, s) = (c.tokens(), c.vit_dim, c.grid, c.patch, c.image_size);
+        if pixels.len() != 3 * s * s {
+            return Err(Error::Input(format!("pixels must be [3, {s}, {s}]")));
+        }
+        let perm = self.store.i32("v.perm")?.to_vec();
+        let eps = c.vit_eps;
+        let t0 = std::time::Instant::now();
+
+        // patches (window order) -> embed GEMM -> + pos -> LN_pre: x0, then
+        // the first LayerNorm (no affine: folded into qkv) of bf16(x0)
+        let ke = self.npu.spec("v_embed")?.k;
+        let mut patches = vec![0u16; t * ke];
+        par_rows(&mut patches, ke, |r0, piece| {
+            for (ri, row) in piece.chunks_mut(ke).enumerate() {
+                let p = perm[r0 + ri] as usize;
+                let (py, px) = (p / g, p % g);
+                for ch in 0..3 {
+                    for ky in 0..ps {
+                        let src = ch * s * s + (py * ps + ky) * s + px * ps;
+                        for kx in 0..ps {
+                            row[(ch * ps + ky) * ps + kx] = f32_to_bf16(pixels[src + kx]);
+                        }
+                    }
+                }
+            }
+        });
+        self.io.v_embed.set_a(&patches)?;
+        gemm(&mut self.npu, &self.io.v_embed, &self.w["v.embed"], &mut self.timing)?;
+        let emb = self.io.v_embed.get_c(t)?;
+        let st = &self.store;
+        let pos = st.f32("v.pos")?;
+        let (lw, lb) = (st.f32("v.ln_pre.w")?, st.f32("v.ln_pre.b")?);
+        let ones = vec![1f32; dim];
+        let zeros = vec![0f32; dim];
+        let mut x0 = vec![0u16; t * dim];
+        let mut h = vec![0u16; t * dim];
+        par_rows(&mut x0, dim, |r0, piece| {
+            let mut tmp = vec![0f32; dim];
+            let mut out = vec![0f32; dim];
+            for (ri, row) in piece.chunks_mut(dim).enumerate() {
+                let r = r0 + ri;
+                for j in 0..dim {
+                    tmp[j] = bf16_to_f32(emb[r * dim + j]) + pos[r * dim + j];
+                }
+                ln_row(&tmp, &mut out, lw, lb, eps);
+                for (o, v) in row.iter_mut().zip(&out) {
+                    *o = f32_to_bf16(*v);
+                }
+            }
+        });
+        par_rows(&mut h, dim, |r0, piece| {
+            let mut xr = vec![0f32; dim];
+            let mut out = vec![0f32; dim];
+            for (ri, row) in piece.chunks_mut(dim).enumerate() {
+                let r = r0 + ri;
+                for j in 0..dim {
+                    xr[j] = bf16_to_f32(x0[r * dim + j]);
+                }
+                ln_row(&xr, &mut out, &ones, &zeros, eps);
+                for (o, v) in row.iter_mut().zip(&out) {
+                    *o = f32_to_bf16(*v);
+                }
+            }
+        });
+        push(&x0, &mut self.io.xres[0])?;
+        self.io.v_qkv.set_a(&h)?;
+        self.timing.add("vit_prologue", t0.elapsed());
+
+        let rope_out = self.io.rope_out.as_ref().ok_or_else(|| Error::Bundle("no RoPE buffer".into()))?;
+        for i in 0..c.vit_layers {
+            let p = |n: &str| format!("v.{i}.{n}");
+            let global = c.vit_global.contains(&i);
+            let (tab, mha_key) = if global { ("v.rope_tab.glob", "mha_glob") } else { ("v.rope_tab.win", "mha_win") };
+            let io = &self.io;
+            gemm_dev(&mut self.npu, &io.v_qkv, &self.w[&p("qkv")], &mut self.timing)?;
+            op(&mut self.npu, "rope", &[&io.v_qkv.c, &self.w[tab], rope_out], &mut self.timing)?;
+            op(&mut self.npu, mha_key, &[rope_out, rope_out, &io.v_qkv.c, &io.v_o.a], &mut self.timing)?;
+            gemm_dev(&mut self.npu, &io.v_o, &self.w[&p("o")], &mut self.timing)?;
+            op(&mut self.npu, "addln", &[&io.xres[0], &io.v_o.c, &io.xres[1], &io.v_fc1.a], &mut self.timing)?;
+            gemm_dev(&mut self.npu, &io.v_fc1, &self.w[&p("fc1")], &mut self.timing)?;
+            gemm_dev(&mut self.npu, &io.v_fc2, &self.w[&p("fc2")], &mut self.timing)?;
+            op(&mut self.npu, "addln", &[&io.xres[1], &io.v_fc2.c, &io.xres[0], &io.v_qkv.a], &mut self.timing)?;
+        }
+        let t1 = std::time::Instant::now();
+        let xb = pull(&self.io.xres[0], t * dim)?;
+        let mut out = vec![0f32; t * dim];
+        for (j, row) in xb.chunks(dim).enumerate() {
+            let r = perm[j] as usize;
+            for (o, &v) in out[r * dim..(r + 1) * dim].iter_mut().zip(row) {
+                *o = bf16_to_f32(v);
+            }
+        }
+        self.timing.add("vit_readback", t1.elapsed());
         Ok(out)
     }
 }

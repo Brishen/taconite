@@ -49,6 +49,16 @@ pub struct MhaSpec {
     pub elems: usize,
 }
 
+/// Any other compiled kernel, launched over buffers the runtime already
+/// holds (the device-resident ViT's RoPE and residual add + LayerNorm).
+#[derive(Debug, Clone)]
+pub struct OpSpec {
+    pub key: String,
+    pub xclbin: PathBuf,
+    pub insts: PathBuf,
+    pub name: String,
+}
+
 /// An end-to-end test case: an image, a prompt and the reference
 /// instances (`case.<idx>.*` tensors).
 #[derive(Debug, Clone)]
@@ -66,6 +76,7 @@ pub struct Manifest {
     pub xclbins: HashMap<String, (PathBuf, String)>,
     pub gemms: HashMap<String, GemmSpec>,
     pub mhas: HashMap<String, MhaSpec>,
+    pub ops: HashMap<String, OpSpec>,
     pub ref_image: Option<PathBuf>,
     pub ref_prompt: Option<String>,
     pub tok_tests: Vec<(usize, String)>,
@@ -126,6 +137,7 @@ impl Manifest {
             xclbins: HashMap::new(),
             gemms: HashMap::new(),
             mhas: HashMap::new(),
+            ops: HashMap::new(),
             ref_image: None,
             ref_prompt: None,
             tok_tests: Vec::new(),
@@ -184,6 +196,16 @@ impl Manifest {
                         elems: field(&a, "elems", line)?,
                     };
                     m.mhas.insert(h.key.clone(), h);
+                }
+                "op" if f.len() >= 2 => {
+                    let a = kv(&f[2..]);
+                    let o = OpSpec {
+                        key: f[1].to_string(),
+                        xclbin: dir.join(a.get("xclbin").ok_or_else(|| bad(format!("no xclbin in: {line}")))?),
+                        insts: dir.join(a.get("insts").ok_or_else(|| bad(format!("no insts in: {line}")))?),
+                        name: a.get("name").cloned().unwrap_or_else(|| "MLIR_AIE".into()),
+                    };
+                    m.ops.insert(o.key.clone(), o);
                 }
                 "ref_image" => m.ref_image = Some(dir.join(rest(1))),
                 "ref_prompt" => m.ref_prompt = Some(rest(1)),
@@ -324,6 +346,13 @@ impl Store {
                 e.len / std::mem::size_of::<T>(),
             )
         })
+    }
+
+    /// Any tensor's raw bytes.
+    pub fn bytes(&self, name: &str) -> Result<&[u8], Error> {
+        let e = self.entry(name)?;
+        // SAFETY: in bounds (checked at load).
+        Ok(unsafe { std::slice::from_raw_parts((self.data.as_ptr() as *const u8).add(e.off), e.len) })
     }
 
     pub fn f32(&self, name: &str) -> Result<&[f32], Error> {

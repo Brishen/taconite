@@ -124,6 +124,17 @@ impl Npu {
             sources.insert(g.key.clone(), s);
             order.push(g.key.clone());
         }
+        for o in m.ops.values() {
+            let s = Source {
+                ctx: o.key.clone(),
+                xclbin: o.xclbin.clone(),
+                insts: o.insts.clone(),
+                name: o.name.clone(),
+                ops: 0,
+            };
+            sources.insert(o.key.clone(), s);
+            order.push(o.key.clone());
+        }
         for h in m.mhas.values() {
             let ops = (4 * h.heads * h.seq * h.seq * h.d) as u64;
             let s = Source {
@@ -302,6 +313,12 @@ impl Npu {
             io.sync_a()?;
         }
         self.run(io, w)
+    }
+
+    /// Runs kernel `key` once over `args` (in its argument order), none
+    /// synced: for kernels chained on device-produced buffers.
+    pub fn run_args(&mut self, key: &str, args: &[&Buffer]) -> Result<Duration, Error> {
+        self.kernel(key)?.run(args).map_err(|e| Error::Npu(format!("{key}: {e}")))
     }
 
     /// Runs the MHA over its q/k/v (already [`push`]ed).
