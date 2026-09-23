@@ -52,8 +52,10 @@ feature map 32x16x24: cosine vs CPU 0.999984, vs Python NPU 1.000000
 CHECK OK
 ```
 
-To run without XRT, build with `--features direct`. The kernels then go
-through the `amdxdna` driver's ioctls (`iron_xrt::direct`). `check` gives the
+To run without XRT, build with `--no-default-features --features cli,direct`.
+The kernels then go through the `amdxdna` driver's ioctls
+(`iron_xrt::direct`); the build needs no XRT headers or library, and the
+binary links none. `check` gives the
 same numbers, and `crop` the same boxes and scores.
 
 - **Resize.** The input resize reproduces Pillow's LANCZOS bit for bit.

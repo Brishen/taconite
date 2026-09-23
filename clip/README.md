@@ -98,8 +98,10 @@ cargo build --release
 ./target/release/clip check bundle
 ```
 
-To run without XRT, build with `--features direct`. The kernels then go
-through the `amdxdna` driver's ioctls (`iron_xrt::direct`). On NPU2, `check`
+To run without XRT, build with `--no-default-features --features cli,direct`.
+The kernels then go through the `amdxdna` driver's ioctls
+(`iron_xrt::direct`); the build needs no XRT headers or library, and the
+binary links none. On NPU2, `check`
 prints the same numbers as the XRT build, at the same speed (~1.29 s for 4
 images × 8 labels).
 

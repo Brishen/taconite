@@ -35,11 +35,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use iron_xrt::{bf16_to_f32, f32_to_bf16};
-// The NPU path: XRT, or the driver's ioctls with no XRT (feature `direct`).
+// The NPU path: XRT (feature `xrt`, the default), or the driver's ioctls
+// with no XRT (feature `direct`, which wins when both are on).
 #[cfg(feature = "direct")]
 use iron_xrt::direct::{Buffer, Kernel, Run, Session};
-#[cfg(not(feature = "direct"))]
+#[cfg(all(feature = "xrt", not(feature = "direct")))]
 use iron_xrt::{Buffer, Kernel, Run, Session};
+#[cfg(not(any(feature = "xrt", feature = "direct")))]
+compile_error!("no NPU path: enable feature `xrt` (the default) or `direct`");
 
 use par::par_rows;
 

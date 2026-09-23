@@ -8,17 +8,21 @@ edition = "2024"
 description = "CLIP ViT-H/14 image and text embeddings / zero-shot classification on an AMD XDNA NPU: IRON kernels replayed through XRT, no Python"
 
 [features]
-default = ["cli"]
+default = ["cli", "xrt"]
 # The `clip` binary: decodes images (the `image` crate). The library itself
 # is std-only.
 cli = ["dep:image"]
+# Run the kernels through XRT (iron-xrt's `xrt` feature: XRT's headers and
+# library at build time).
+xrt = ["iron-xrt/xrt", "sam3/xrt"]
 # Run the kernels through the amdxdna driver's ioctls (`iron_xrt::direct`)
-# instead of XRT.
-direct = []
+# instead of XRT; it wins when both are on. For a build with no XRT at all:
+# `--no-default-features --features cli,direct`.
+direct = ["sam3/direct"]
 
 [dependencies]
 iron-bundle = { path = "../iron-bundle" }
-iron-xrt = { path = "../iron-xrt" }
+iron-xrt = { path = "../iron-xrt", default-features = false }
 # the CLIP BPE tokenizer and the threaded host-math helpers
 sam3 = { path = "../sam3", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }

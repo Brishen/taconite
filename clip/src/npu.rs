@@ -14,11 +14,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use iron_bundle::Manifest;
-// The NPU path: XRT, or the driver's ioctls with no XRT (feature `direct`).
+// The NPU path: XRT (feature `xrt`, the default), or the driver's ioctls
+// with no XRT (feature `direct`, which wins when both are on).
 #[cfg(feature = "direct")]
 pub use iron_xrt::direct::{Buffer, Kernel, Session};
-#[cfg(not(feature = "direct"))]
+#[cfg(all(feature = "xrt", not(feature = "direct")))]
 pub use iron_xrt::{Buffer, Kernel, Session};
+#[cfg(not(any(feature = "xrt", feature = "direct")))]
+compile_error!("no NPU path: enable feature `xrt` (the default) or `direct`");
 
 use crate::Error;
 
