@@ -22,7 +22,8 @@
 //! syncs around a run, so activations never take an extra copy on the way
 //! to or from the array.
 //!
-//! The [`compile`] module builds those kernels, too — Peano and the native
+//! The `direct` module runs them with no XRT at all, through the `amdxdna`
+//! driver's ioctls. The [`compile`] module builds those kernels, too — Peano and the native
 //! `aiecc` as subprocesses, still no Python — from a design's MLIR.
 //!
 //! Everything returns [`Result`]; the shim never prints or aborts. The
@@ -39,6 +40,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod compile;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod direct;
 
 mod ffi {
     use super::*;

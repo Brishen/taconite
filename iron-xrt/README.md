@@ -63,3 +63,34 @@ to IRON's. The xclbin differs only in its timestamps and UUIDs.
 
 Adapted from [RLX](https://github.com/MIT-RLX/rlx)'s `rlx-xdna` `compile.rs`
 (MIT OR Apache-2.0).
+
+## Running without XRT: `direct`
+
+`iron_xrt::direct` runs the same kernels with no XRT and no C++. It is
+Linux/x86-64 only, and it talks to the `amdxdna` driver's ioctls on
+`/dev/accel/accel0` itself. It has the same shape as the XRT API:
+
+- **`Device`**: the accel node, plus the process's 64 MiB device heap.
+- **`Kernel`**: a hardware context of its own, loaded from an xclbin and an
+  instruction stream.
+- **`Buffer`**: shared buffers the host fills in place. `run` takes up to
+  five of them, the `MLIR_AIE` kernel's `bo0`…`bo4`.
+
+It issues the same ioctl sequence XRT does. The sequence and the command
+packet were captured by tracing this crate's XRT path, and `direct` reproduces
+it, so each run is one `EXEC_CMD` plus one fence wait. `Device` can also
+query the firmware version and the hardware contexts (with their command
+counters and fault state), and set the NPU power mode (this needs root).
+
+On an NPU2 it computes the same results as XRT at the same speed. For
+example, `examples/direct_eltwise_mul.rs` multiplies 1,638,400 bf16 values
+with a median run of 235 µs through `direct` and 232 µs through XRT, and 0
+mismatches either way. `tests/direct_hw.rs` (`--ignored`, needs an NPU) loads,
+runs and releases 60 contexts. It does not cover sub-buffers, async launch, or
+xclbins with more than one PDI.
+
+Adapted from [RLX](https://github.com/MIT-RLX/rlx)'s `rlx-xdna` `direct.rs`
+(MIT OR Apache-2.0). RLX never saw a command complete on NPU1. The likely
+cause is its fence wait's timeout: the DRM syncobj ioctls read the timeout as
+an absolute deadline, and RLX passed a relative one. That makes the wait
+return at once with the command still `NEW`, and it reproduces here.
