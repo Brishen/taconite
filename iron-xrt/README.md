@@ -17,7 +17,7 @@ three types:
 
 - **`Session`**: the NPU.
 - **`Kernel`**: a resident hardware context, shared by every kernel loaded
-  from the same xclbin. Runs are cached per argument tuple, with a blocking
+  from the same xclbin and released when the last of them is dropped. Runs are cached per argument tuple, with a blocking
   `run` and an async `start`/`wait`.
 - **`Buffer`**: a host-visible BO the host writes in place, with `sub`-buffer
   views.

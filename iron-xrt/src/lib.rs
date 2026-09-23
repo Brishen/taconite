@@ -186,9 +186,11 @@ impl Session {
         self.inner.raw.as_ptr()
     }
 
-    /// Loads an xclbin + instruction stream into a hardware context of its
-    /// own, resident until the [`Kernel`] is dropped. `kernel_name` is the
-    /// kernel inside the xclbin (`None`: its first — IRON's is `MLIR_AIE`).
+    /// Loads an xclbin + instruction stream. Kernels naming the same xclbin
+    /// (and kernel name) share one hardware context, resident until the last
+    /// of them is dropped -- dropping them frees the context for another
+    /// (NPU2 holds 16, across every process). `kernel_name` is the kernel
+    /// inside the xclbin (`None`: its first — IRON's is `MLIR_AIE`).
     ///
     /// `ops_per_run` is the work one [`Kernel::run`] performs — `2·M·K·N`
     /// for a GEMM, a multiply-add counting two — declared to the driver as
@@ -241,7 +243,7 @@ impl Session {
     }
 }
 
-/// A compiled kernel in its own resident hardware context.
+/// A compiled kernel on its (possibly shared) resident hardware context.
 pub struct Kernel {
     raw: NonNull<ffi::iron_kernel>,
     _session: Session,

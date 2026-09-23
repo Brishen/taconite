@@ -87,6 +87,8 @@ struct tuple_hash {
 
 struct iron_kernel {
     iron_session *session = nullptr;
+    // The `xclbins` entry this kernel runs on; freed with its last kernel.
+    std::string xclbin_key;
     xrt::hw_context context;
     xrt::kernel kernel;
     xrt::bo insts_bo;
@@ -209,8 +211,6 @@ iron_kernel *iron_kernel_load(iron_session *s,
             name = kernels.front().get_name();
         }
 
-        auto *k = new iron_kernel;
-        k->session = s;
         std::string key = std::string{xclbin_path} + "\n" + name;
         auto found = s->xclbins.find(key);
         if (found == s->xclbins.end()) {
@@ -225,6 +225,9 @@ iron_kernel *iron_kernel_load(iron_session *s,
             lx.kernel = xrt::kernel(lx.context, name);
             found = s->xclbins.emplace(key, std::move(lx)).first;
         }
+        auto *k = new iron_kernel;
+        k->session = s;
+        k->xclbin_key = key;
         k->context = found->second.context;
         k->kernel = found->second.kernel;
         k->insts_bytes = static_cast<size_t>(n);
@@ -243,9 +246,16 @@ void iron_kernel_free(iron_kernel *k)
 {
     if (!k)
         return;
-    auto &ks = k->session->kernels;
+    auto *s = k->session;
+    std::string key = k->xclbin_key;
+    auto &ks = s->kernels;
     ks.erase(std::remove(ks.begin(), ks.end(), k), ks.end());
     delete k;
+    // The last kernel on a context releases it, so a caller can make room
+    // for another (NPU2 holds at most 16 contexts, across all processes).
+    bool used = std::any_of(ks.begin(), ks.end(), [&](const iron_kernel *o) { return o->xclbin_key == key; });
+    if (!used)
+        s->xclbins.erase(key);
 }
 
 iron_buffer *iron_buffer_alloc(iron_session *s, size_t bytes, char *err, size_t err_len)

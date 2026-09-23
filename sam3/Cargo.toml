@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "sam3"
+version = "0.1.0"
+edition = "2024"
+description = "SAM3 (Segment Anything 3) text-prompted segmentation on an AMD XDNA NPU: IRON kernels replayed through XRT, no Python"
+
+[features]
+default = ["cli"]
+# The `sam3` binary: decodes images (the `image` crate) and writes overlays.
+# The library itself is std-only.
+cli = ["dep:image"]
+
+[dependencies]
+iron-xrt = { path = "../iron-xrt" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+
+[[bin]]
+name = "sam3"
+required-features = ["cli"]
+
+[profile.release]
+debug = 1
