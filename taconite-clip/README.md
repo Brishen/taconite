@@ -13,6 +13,10 @@ transformers on the AMD XDNA NPU (NPU2) through IRON kernels replayed with
 [IRON](https://github.com/amd/IRON)'s Python app
 (`iron/applications/clip_vit_h14`), kernel for kernel.
 
+A prebuilt NPU2 bundle is on Hugging Face:
+[`brishen/iron-clip-vit-h14-npu2`](https://huggingface.co/brishen/iron-clip-vit-h14-npu2)
+(`hf download brishen/iron-clip-vit-h14-npu2 --local-dir clip`).
+
 ```bash
 clip classify <bundle> cats.jpg car.png --label cat --label dog --label car
 #   cats.jpg: cat 1.000, dog 0.000, car 0.000

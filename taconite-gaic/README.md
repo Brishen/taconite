@@ -11,6 +11,10 @@ runs on the host. The
 library is std-only. The `gaic` binary adds image decoding and writing through
 the `image` crate (feature `cli`, on by default).
 
+A prebuilt NPU2 bundle is on Hugging Face:
+[`brishen/iron-gaic-vgg16-npu2`](https://huggingface.co/brishen/iron-gaic-vgg16-npu2)
+(`hf download brishen/iron-gaic-vgg16-npu2 --local-dir gaic`).
+
 The bundle uses the format every IRON bundle shares, read with
 [`taconite-bundle`](https://crates.io/crates/taconite-bundle): `manifest.txt` (the kernels, the conv
 layer table and the head, parsed and cross-checked against the tensors at
