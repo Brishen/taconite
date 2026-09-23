@@ -296,12 +296,75 @@ impl Entry {
     }
 }
 
-/// Every tensor of the bundle, in memory. The backing store is `u64`s so
-/// the 64-byte-aligned offsets `tensors.txt` records are aligned in memory
-/// too, and the typed views below are sound.
+/// Every tensor of the bundle. On Unix `tensors.bin` is memory-mapped
+/// read-only: a tensor's pages are read when it is first touched and stay
+/// reclaimable page cache, so loading a multi-GB bundle costs no heap and
+/// a runtime that uploads its weights and drops the store never holds them
+/// twice. Elsewhere (or if mapping fails) the file is read into a `u64`
+/// buffer. Either way the 64-byte-aligned offsets `tensors.txt` records are
+/// aligned in memory (mappings are page-aligned), so the typed views below
+/// are sound. Don't rewrite a bundle's `tensors.bin` while a runtime has it
+/// loaded: exporters write new directories.
 pub struct Store {
-    data: Vec<u64>,
+    data: Backing,
     map: HashMap<String, Entry>,
+}
+
+enum Backing {
+    Heap(Vec<u64>),
+    #[cfg(unix)]
+    Mapped(mmap::Map),
+}
+
+impl Backing {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Backing::Heap(v) => v.as_ptr() as *const u8,
+            #[cfg(unix)]
+            Backing::Mapped(m) => m.ptr,
+        }
+    }
+}
+
+#[cfg(unix)]
+mod mmap {
+    //! A read-only private file mapping, through libc's `mmap` (std has no
+    //! wrapper; the constants are the same on Linux and macOS).
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    }
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2;
+
+    pub struct Map {
+        pub ptr: *const u8,
+        len: usize,
+    }
+
+    // SAFETY: the mapping is read-only and owned by the Map for its life.
+    unsafe impl Send for Map {}
+    unsafe impl Sync for Map {}
+
+    impl Map {
+        /// `file`'s first `len` bytes (`len > 0`), or None if mmap fails.
+        pub fn new(file: &std::fs::File, len: usize) -> Option<Map> {
+            // SAFETY: a fresh read-only mapping of a file we hold open; the
+            // result is checked against MAP_FAILED (-1).
+            let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+            if p as isize == -1 { None } else { Some(Map { ptr: p as *const u8, len }) }
+        }
+    }
+
+    impl Drop for Map {
+        fn drop(&mut self) {
+            // SAFETY: the mapping this Map created, unmapped once.
+            unsafe { munmap(self.ptr as *mut c_void, self.len) };
+        }
+    }
 }
 
 impl Store {
@@ -339,10 +402,20 @@ impl Store {
         let bin = dir.join("tensors.bin");
         let mut file = fs::File::open(&bin).map_err(|e| Error::Io(bin.clone(), e))?;
         let bytes = file.metadata().map_err(|e| Error::Io(bin.clone(), e))?.len() as usize;
-        let mut data = vec![0u64; bytes.div_ceil(8)];
-        // SAFETY: a u64 buffer viewed as its bytes.
-        let raw = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, bytes) };
-        file.read_exact(raw).map_err(|e| Error::Io(bin.clone(), e))?;
+        #[cfg(unix)]
+        let mapped = if bytes > 0 { mmap::Map::new(&file, bytes).map(Backing::Mapped) } else { None };
+        #[cfg(not(unix))]
+        let mapped = None;
+        let data = match mapped {
+            Some(m) => m,
+            None => {
+                let mut data = vec![0u64; bytes.div_ceil(8)];
+                // SAFETY: a u64 buffer viewed as its bytes.
+                let raw = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, bytes) };
+                file.read_exact(raw).map_err(|e| Error::Io(bin.clone(), e))?;
+                Backing::Heap(data)
+            }
+        };
         for (name, e) in &map {
             if e.off + e.len > bytes {
                 return Err(bad(format!("tensor {name} runs past the end of tensors.bin")));
@@ -382,12 +455,10 @@ impl Store {
             return Err(bad(format!("tensor {name} is {:?}, wanted {want:?}", e.dtype)));
         }
         // SAFETY: in bounds (checked at load), aligned (8-byte offsets into a
-        // u64 buffer), and every bit pattern is a valid f32/u16/u8/i32.
+        // u64 buffer or a page-aligned mapping), and every bit pattern is a
+        // valid f32/u16/u8/i32.
         Ok(unsafe {
-            std::slice::from_raw_parts(
-                (self.data.as_ptr() as *const u8).add(e.off) as *const T,
-                e.len / std::mem::size_of::<T>(),
-            )
+            std::slice::from_raw_parts(self.data.as_ptr().add(e.off) as *const T, e.len / std::mem::size_of::<T>())
         })
     }
 
@@ -395,7 +466,7 @@ impl Store {
     pub fn bytes(&self, name: &str) -> Result<&[u8], Error> {
         let e = self.entry(name)?;
         // SAFETY: in bounds (checked at load).
-        Ok(unsafe { std::slice::from_raw_parts((self.data.as_ptr() as *const u8).add(e.off), e.len) })
+        Ok(unsafe { std::slice::from_raw_parts(self.data.as_ptr().add(e.off), e.len) })
     }
 
     pub fn f32(&self, name: &str) -> Result<&[f32], Error> {

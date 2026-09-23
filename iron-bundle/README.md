@@ -41,4 +41,14 @@ for r in m.tagged("gemm") {
 }
 ```
 
-Used by `iron/rust/sam3` and `iron/rust/adaface-ir-runtime`.
+`Store::load` memory-maps `tensors.bin` (on Unix; elsewhere it reads it):
+loading is instant, a tensor's pages are read when it is first touched, and
+they stay reclaimable page cache, so a 2 GB bundle costs no heap. Don't
+rewrite a bundle's `tensors.bin` while a runtime has it loaded.
+
+Every IRON model with a Rust runtime reads its bundle through this crate:
+`iron/rust/sam3`, `iron/rust/adaface-ir-runtime` (AdaFace IR-18 / IR-101),
+`iron/rust/clip`, `iron/rust/gaic`, `iron/applications/detr_resnet50/rust`,
+`iron/applications/all_minilm_l6_v2/rust`,
+`iron/applications/nli_minilm2_l6_h768/rust`, and, outside this repo,
+image-organizer's tagger (Taggerine, from a vendored copy).
