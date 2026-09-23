@@ -16,11 +16,28 @@ categories = ["hardware-support", "api-bindings"]
 # wants XRT's lib dir on its rpath has to re-emit it.
 links = "ironxrt"
 
+[features]
+default = ["xrt"]
+# The XRT path (`Session`, `Kernel`, `Run`, `Buffer` at the crate root):
+# build.rs compiles the C++ shim and links XRT, so building needs XRT's
+# headers and library. Without it the crate is pure Rust — `compile`, and
+# `direct` (the amdxdna ioctls) on Linux/x86-64 — and builds with no XRT.
+xrt = []
+
 # Deliberately no dependencies: build.rs drives g++/ar itself (no `cc`
 # crate) so the crate builds offline, and the API is plain `std`.
 [dependencies]
+
+[[example]]
+name = "eltwise_mul"
+required-features = ["xrt"]
+
+[[example]]
+name = "direct_eltwise_mul"
+required-features = ["xrt"]
 
 # The NPU and XRT are Linux/x86-64 only; build.rs skips the shim on docs.rs,
 # which has neither XRT's headers nor the library.
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+all-features = true

@@ -31,8 +31,10 @@
 //! XRT's C++ headers need `uuid/uuid.h` (libuuid's development headers). No
 //! build dependencies (no `cc` crate) so this builds offline.
 //!
-//! On docs.rs (`$DOCS_RS`), which has neither XRT nor its headers, nothing is
-//! built or linked: rustdoc needs only the Rust sources.
+//! Only with the `xrt` feature (the default). Without it, or on docs.rs
+//! (`$DOCS_RS`), which has neither XRT nor its headers, nothing is built or
+//! linked: the rest of the crate is plain Rust, and rustdoc needs only the
+//! Rust sources.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -44,7 +46,9 @@ fn main() {
     println!("cargo:rerun-if-changed=xrt.dynlist");
     println!("cargo:rerun-if-env-changed=XRT_ROOT");
     println!("cargo:rerun-if-env-changed=XRT_STATIC_ROOT");
-    if env::var_os("DOCS_RS").is_some() {
+    // Without the `xrt` feature there is nothing to build or link; on
+    // docs.rs there is no XRT to build against.
+    if env::var_os("CARGO_FEATURE_XRT").is_none() || env::var_os("DOCS_RS").is_some() {
         return;
     }
 

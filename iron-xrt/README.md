@@ -21,11 +21,20 @@ crate, so it builds offline). It provides three types:
 
 ## Building
 
-The crate targets Linux on x86-64 with an XDNA NPU (the `amdxdna` driver) and
-[XRT](https://github.com/Xilinx/XRT). Building needs `g++`, `ar`, XRT's
-headers and libuuid's (`uuid/uuid.h`); `build.rs` compiles the shim itself,
-with no build dependencies, so it also builds offline. It links XRT one of
-two ways:
+The crate targets Linux on x86-64 with an XDNA NPU (the `amdxdna` driver).
+The XRT types above need the `xrt` feature, on by default. Without it
+(`default-features = false`) nothing below applies: the crate is plain Rust
+(`compile`, `direct`, `Error`, the bf16 helpers) and builds with no XRT, no
+C++ compiler and no system headers:
+
+```toml
+iron-xrt = { version = "0.1", default-features = false }
+```
+
+With `xrt`, building needs [XRT](https://github.com/Xilinx/XRT): `g++`,
+`ar`, XRT's headers and libuuid's (`uuid/uuid.h`). `build.rs` compiles the
+shim itself, with no build dependencies, so it also builds offline. It links
+XRT one of two ways:
 
 - **Dynamically** (the usual case), from `$XRT_ROOT` (default
   `/opt/xilinx/xrt`). The binary then needs XRT's lib dir on the loader path,
@@ -91,7 +100,8 @@ Adapted from [RLX](https://github.com/MIT-RLX/rlx)'s `rlx-xdna` `compile.rs`
 
 ## Running without XRT: `direct`
 
-`iron_xrt::direct` runs the same kernels with no XRT and no C++. It is
+`iron_xrt::direct` runs the same kernels with no XRT and no C++ (build with
+`default-features = false` to leave XRT out entirely). It is
 Linux/x86-64 only, and it talks to the `amdxdna` driver's ioctls on
 `/dev/accel/accel0` itself. Its types and methods match the XRT API, so a
 model switches paths by changing its `use` line:
