@@ -113,10 +113,10 @@ counters and fault state), and set the NPU power mode (this needs root).
 
 On an NPU2 it computes the same results as XRT at the same speed:
 
-- **A complete model.** `gaic` has a `direct` feature that swaps its `use`
-  line. With it, `gaic check` (VGG16 plus the GAIC head, 73 dispatches) passes
-  with the same metrics as XRT, at ~50 ms per image. `gaic crop` gives
-  identical boxes and scores on five photos in two shapes.
+- **Complete models.** Switched over by their `use` line, a VGG16-based
+  image-cropping model (73 dispatches per image) gives the same boxes and
+  scores as through XRT at ~50 ms per image, and SAM3 and CLIP ViT-H/14 give
+  identical outputs at the same speed.
 - **A single kernel.** `examples/direct_eltwise_mul.rs` multiplies 1,638,400
   bf16 values with a median run of 235 µs through `direct` and 232 µs through
   XRT, with 0 mismatches either way.

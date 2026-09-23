@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn bf16_round_trips_and_rounds_to_nearest_even() {
-        for &x in &[0.0f32, 1.0, -2.5, 3.14159, 1e-3, 65504.0, -1e30] {
+        for &x in &[0.0f32, 1.0, -2.5, std::f32::consts::PI, 1e-3, 65504.0, -1e30] {
             let b = f32_to_bf16(x);
             let back = bf16_to_f32(b);
             assert!((back - x).abs() <= x.abs() * (1.0 / 128.0) + 1e-30, "{x} -> {back}");
