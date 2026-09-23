@@ -5,13 +5,13 @@
 //! it plus XRT's `libxrt_coreutil`, one of two ways:
 //!
 //! - **static** (the default when `$XRT_STATIC_ROOT`, or its default
-//!   `~/npu/xrt-static`, holds `lib/libxrt_coreutil.a` — the tree
-//!   `scripts/build-xrt-static.sh` builds from the ai/xrt fork): coreutil and
-//!   the two archives it references go *into* the binary. The binary then has
-//!   no `DT_NEEDED` on any `libxrt_*`, starts on a machine without XRT, and
-//!   only opening the NPU needs XRT's shared pieces — `libxrt_core.so.2` and
-//!   the amdxdna driver plug-in, which coreutil dlopens from `/opt/xilinx/xrt`
-//!   (or `$XILINX_XRT`) and reports as a clean error when they are missing.
+//!   `~/npu/xrt-static`, holds `lib/libxrt_coreutil.a` — an XRT install tree
+//!   built with static archives): coreutil and the two archives it references
+//!   go *into* the binary. The binary then has no `DT_NEEDED` on any
+//!   `libxrt_*`, starts on a machine without XRT, and only opening the NPU
+//!   needs XRT's shared pieces — `libxrt_core.so.2` and the amdxdna driver
+//!   plug-in, which coreutil dlopens from `/opt/xilinx/xrt` (or
+//!   `$XILINX_XRT`) and reports as a clean error when they are missing.
 //!   Those plug-ins name `libxrt_coreutil.so.2` as a dependency, so a second,
 //!   shared copy of coreutil loads next to the static one; `xrt.dynlist` puts
 //!   every XRT symbol of the executable into its dynamic symbol table so the
@@ -20,17 +20,19 @@
 //!   references would otherwise be missing from the executable and resolve
 //!   to the shared copy — split state). The list only reaches the binaries
 //!   of the package whose build script emits it, so it is published as
-//!   `DEP_IRONXRT_DYNLIST` and re-emitted by `iced-app` and
-//!   `image-organizer-tagger` (NPU.md, "Linking XRT statically").
+//!   `DEP_IRONXRT_DYNLIST` for a dependent's build script to re-emit as
+//!   `-Wl,--dynamic-list=…`.
 //!
-//! - **dynamic** (`$XRT_ROOT`, default `/opt/xilinx/xrt`, the tree
-//!   `scripts/npu-env.sh` puts on the loader path): links
-//!   `libxrt_coreutil.so.2`, publishes the lib dir as `DEP_IRONXRT_LIBDIR`
-//!   for dependents to re-emit as an rpath.
+//! - **dynamic** (`$XRT_ROOT`, default `/opt/xilinx/xrt`, the tree XRT's
+//!   `setup.sh` puts on the loader path): links `libxrt_coreutil.so.2`,
+//!   publishes the lib dir as `DEP_IRONXRT_LIBDIR` for dependents to re-emit
+//!   as an rpath.
 //!
-//! XRT's C++ headers need `uuid/uuid.h`, which `shell.nix` provides via
-//! `util-linux.dev`. No build dependencies (no `cc` crate) so this builds
-//! offline, the way `iron/rust/adaface-ir-runtime` in the IRON checkout does.
+//! XRT's C++ headers need `uuid/uuid.h` (libuuid's development headers). No
+//! build dependencies (no `cc` crate) so this builds offline.
+//!
+//! On docs.rs (`$DOCS_RS`), which has neither XRT nor its headers, nothing is
+//! built or linked: rustdoc needs only the Rust sources.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -42,6 +44,9 @@ fn main() {
     println!("cargo:rerun-if-changed=xrt.dynlist");
     println!("cargo:rerun-if-env-changed=XRT_ROOT");
     println!("cargo:rerun-if-env-changed=XRT_STATIC_ROOT");
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -62,7 +67,7 @@ fn main() {
         .arg("-o")
         .arg(&obj)
         .status()
-        .expect("failed to invoke g++ (is it on PATH? build inside nix-shell)");
+        .expect("failed to invoke g++ (is it on PATH?)");
     assert!(status.success(), "g++ failed to compile iron_xrt_shim.cpp against {}", inc.display());
 
     let status = Command::new("ar")
@@ -78,11 +83,11 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib.display());
 
     if let Some(root) = &static_root {
-        // A refreshed tree (scripts/build-xrt-static.sh re-run) relinks. A
-        // tree that did not exist at the last build does not: cargo re-runs
-        // a build script on every build when a watched path is missing, so
-        // the default location is not watched — `cargo clean -p
-        // iron-xrt` after creating it.
+        // A refreshed tree (XRT rebuilt into it) relinks. A tree that did
+        // not exist at the last build does not: cargo re-runs a build script
+        // on every build when a watched path is missing, so the default
+        // location is not watched — `cargo clean -p iron-xrt` after creating
+        // it.
         println!("cargo:rerun-if-changed={}", root.join("lib").join("libxrt_coreutil.a").display());
         // `-bundle`: passed to the final link from this directory rather
         // than copied into the rlib, so `+whole-archive` applies there —
@@ -102,8 +107,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         // Only effective when this crate is the final artifact (it never
         // is); dependents re-emit it from DEP_IRONXRT_LIBDIR, or rely on
-        // XRT's setup.sh / scripts/npu-env.sh having put the lib dir on the
-        // loader path.
+        // XRT's setup.sh having put the lib dir on the loader path.
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
         println!("cargo:libdir={}", lib.display());
     }
@@ -123,7 +127,7 @@ fn static_root() -> Option<PathBuf> {
         let root = PathBuf::from(root);
         assert!(
             has_archive(&root),
-            "XRT_STATIC_ROOT={} has no lib/libxrt_coreutil.a — run scripts/build-xrt-static.sh, or unset it to link XRT dynamically from $XRT_ROOT",
+            "XRT_STATIC_ROOT={} has no lib/libxrt_coreutil.a — point it at an XRT tree built with static archives, or unset it to link XRT dynamically from $XRT_ROOT",
             root.display()
         );
         return Some(root);

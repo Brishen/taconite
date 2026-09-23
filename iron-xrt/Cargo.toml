@@ -5,7 +5,12 @@
 name = "iron-xrt"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Replays IRON (mlir-aie) kernels on an AMD XDNA NPU through XRT, with no Python at run time"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["npu", "xdna", "xrt", "aie", "amd"]
+categories = ["hardware-support", "api-bindings"]
 # Lets a dependent's build script read `DEP_IRONXRT_LIBDIR` (see build.rs):
 # `cargo:rustc-link-arg` does not propagate across crates, so a binary that
 # wants XRT's lib dir on its rpath has to re-emit it.
@@ -14,3 +19,8 @@ links = "ironxrt"
 # Deliberately no dependencies: build.rs drives g++/ar itself (no `cc`
 # crate) so the crate builds offline, and the API is plain `std`.
 [dependencies]
+
+# The NPU and XRT are Linux/x86-64 only; build.rs skips the shim on docs.rs,
+# which has neither XRT's headers nor the library.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
