@@ -1,32 +1,57 @@
 <!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 SPDX-License-Identifier: Apache-2.0
 -->
 
 # `iron-xrt` — replay IRON kernels through XRT from Rust
 
-This crate is vendored from image-organizer's `crates/iron`, where
-the Taggerine tagger runs on it. Only the package name, doc references and
-the C++ formatting (this repo's `.clang-format`) differ. [`gaic`](../gaic) builds on it.
-
-IRON is an ahead-of-time compiler. What it leaves behind for a kernel is an
-`.xclbin` plus an instruction stream (`*.insts.bin`). This crate runs those
-with no Python, through a small C shim over XRT's C++ API (`iron_xrt_shim.cpp`,
-compiled by `build.rs` with no `cc` crate, so it builds offline). It provides
-three types:
+[IRON](https://github.com/amd/IRON) is an ahead-of-time compiler. What it
+leaves behind for a kernel is an `.xclbin` plus an instruction stream
+(`*.insts.bin`). This crate runs those with no Python, through a small C shim
+over XRT's C++ API (`iron_xrt_shim.cpp`, compiled by `build.rs` with no `cc`
+crate, so it builds offline). It provides three types:
 
 - **`Session`**: the NPU.
 - **`Kernel`**: a resident hardware context, shared by every kernel loaded
-  from the same xclbin and released when the last of them is dropped. Runs are cached per argument tuple, with a blocking
-  `run` and an async `start`/`wait`.
+  from the same xclbin and released when the last of them is dropped. Runs
+  are cached per argument tuple, with a blocking `run` and an async
+  `start`/`wait`.
 - **`Buffer`**: a host-visible BO the host writes in place, with `sub`-buffer
   views.
 
-`build.rs` links XRT statically from `$XRT_STATIC_ROOT` (default
-`~/npu/xrt-static`) when that tree exists. Otherwise it links dynamically from
-`$XRT_ROOT` (default `/opt/xilinx/xrt`). It publishes `DEP_IRONXRT_DYNLIST` /
-`DEP_IRONXRT_LIBDIR` for dependents to re-emit; see `gaic/build.rs`. Building
-also needs XRT's headers and `uuid/uuid.h`.
+## Building
+
+The crate targets Linux on x86-64 with an XDNA NPU (the `amdxdna` driver) and
+[XRT](https://github.com/Xilinx/XRT). Building needs `g++`, `ar`, XRT's
+headers and libuuid's (`uuid/uuid.h`); `build.rs` compiles the shim itself,
+with no build dependencies, so it also builds offline. It links XRT one of
+two ways:
+
+- **Dynamically** (the usual case), from `$XRT_ROOT` (default
+  `/opt/xilinx/xrt`). The binary then needs XRT's lib dir on the loader path,
+  e.g. after sourcing XRT's `setup.sh`.
+- **Statically**, from `$XRT_STATIC_ROOT` (default `~/npu/xrt-static`) when
+  it holds `lib/libxrt_coreutil.a`, an XRT tree built with static archives.
+  The binary then starts on a machine without XRT, and only opening the NPU
+  needs XRT's driver plug-in. Set `XRT_STATIC_ROOT=` (empty) to force the
+  dynamic link.
+
+Linker arguments don't propagate across crates, so `build.rs` publishes what a
+binary needs for a dependent's build script to re-emit: `DEP_IRONXRT_LIBDIR`
+(dynamic; the rpath) and `DEP_IRONXRT_DYNLIST` (static; the symbol list the
+driver plug-ins bind to):
+
+```rust
+// build.rs of a crate that depends on iron-xrt
+fn main() {
+    if let Ok(dir) = std::env::var("DEP_IRONXRT_LIBDIR") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    }
+    if let Ok(list) = std::env::var("DEP_IRONXRT_DYNLIST") {
+        println!("cargo:rustc-link-arg=-Wl,--dynamic-list={list}");
+    }
+}
+```
 
 ## Building kernels: `compile`
 
@@ -51,8 +76,8 @@ tc.compile_design(&Design::new("mul.mlir", "out/work").link("out/mul.o"),
 ```
 
 aiecc packages the xclbin with XRT's `xclbinutil`, so that must be on its
-`PATH`. mlir-aie's binaries are built for a generic Linux. On NixOS they run
-in the IRON container instead: `Toolchain::with_launcher` prefixes every tool
+`PATH`. mlir-aie's binaries are built for a generic Linux. Where they can't
+run as-is (NixOS, say), run them in a container instead: `Toolchain::with_launcher` prefixes every tool
 invocation with a command, for example a script that runs
 `podman run … --entrypoint "$1" <image> "${@:2}"` with the same paths mounted.
 

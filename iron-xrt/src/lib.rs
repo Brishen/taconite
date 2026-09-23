@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
 //! Replaying [IRON](https://github.com/amd/iron) kernels on an AMD XDNA NPU
@@ -10,9 +10,7 @@
 //! the inputs, submit `(opcode 3, instructions, byte count, buffers…)`,
 //! wait" — the XRT C++ API, wrapped here by a small C shim
 //! (`iron_xrt_shim.cpp`) compiled by `build.rs`. Nothing else of IRON is
-//! needed once the kernels exist; `iron/rust/gaic` replays the bundle
-//! `iron/applications/gaic/export_gaic.py` writes. (Vendored from
-//! image-organizer's `crates/iron`, where the tagger uses it the same way.)
+//! needed once the kernels exist.
 //!
 //! Three types: a [`Session`] (the device), [`Kernel`]s loaded into it (each
 //! a *resident* hardware context — NPU2 allows 16 at once, and switching

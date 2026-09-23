@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
 // See iron_xrt_shim.h. Mirrors what IRON's Python host runtime does per
