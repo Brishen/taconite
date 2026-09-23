@@ -3,7 +3,7 @@
 
 //! GAIC (Grid Anchor based Image Cropping, VGG16 backbone) on an AMD XDNA
 //! NPU, replaying the bundle `iron/applications/gaic/export_gaic.py`
-//! writes: no Python, no ONNX, just XRT through [`taconite`].
+//! writes, through [`taconite`].
 //!
 //! [`Gaic::features`] runs the backbone once per image — the 13 VGG16
 //! convs, each one flm.GEMM over an im2col *view* (see

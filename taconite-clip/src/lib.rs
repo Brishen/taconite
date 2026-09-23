@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! CLIP ViT-H/14 (`laion/CLIP-ViT-H-14-laion2B-s32B-b79K`) image and text
-//! embeddings on an AMD XDNA NPU, with no Python at run time.
+//! embeddings on an AMD XDNA NPU.
 //!
 //! The bundle `iron/applications/clip_vit_h14/export_clip.py` writes holds
 //! every compiled IRON kernel and the model's weights (the NPU ones

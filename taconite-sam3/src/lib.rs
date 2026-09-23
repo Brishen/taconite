@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! SAM3 (Segment Anything 3) text-prompted instance segmentation on an AMD
-//! XDNA NPU, with no Python at run time.
+//! XDNA NPU.
 //!
 //! The bundle `iron/applications/sam3/export_sam3.py` writes holds every
 //! compiled IRON kernel and the model's weights (NPU ones pre-packed); this

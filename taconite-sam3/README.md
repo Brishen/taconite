@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # `taconite-sam3` — SAM3 text-prompted segmentation on the NPU, from Rust
 
-A zero-Python runtime for [SAM 3](https://huggingface.co/facebook/sam3):
+A Rust runtime for [SAM 3](https://huggingface.co/facebook/sam3):
 give it an image and a text prompt ("cat", "person", "laptop") and it
 returns every matching instance's score, box and mask. The heavy image
 side runs on the AMD XDNA NPU (NPU2) through IRON kernels replayed with

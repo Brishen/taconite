@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 [IRON](https://github.com/amd/IRON) is an ahead-of-time compiler. What it
 leaves behind for a kernel is an `.xclbin` plus an instruction stream
-(`*.insts.bin`). This crate runs those with no Python, through a small C shim
+(`*.insts.bin`). This crate runs those through a small C shim
 over XRT's C++ API (`iron_xrt_shim.cpp`, compiled by `build.rs` with no `cc`
 crate, so it builds offline). It provides three types:
 
@@ -64,7 +64,7 @@ fn main() {
 
 ## Building kernels: `compile`
 
-`taconite::compile` builds the kernels too, still without Python. It runs
+`taconite::compile` builds the kernels too. It runs
 the two tools IRON's Python drives as subprocesses, with the flags IRON and
 mlir-aie pass them:
 

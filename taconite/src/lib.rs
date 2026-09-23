@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Replaying [IRON](https://github.com/amd/iron) kernels on an AMD XDNA NPU
-//! from Rust, through XRT, with no Python at run time.
+//! from Rust, through XRT.
 //!
 //! IRON is an ahead-of-time compiler: a kernel is an `.xclbin` (the array
 //! configuration and the cores' programs) plus an instruction stream for the
@@ -22,8 +22,7 @@
 //!
 //! The `direct` module runs them with no XRT at all, through the `amdxdna`
 //! driver's ioctls. The [`compile`] module builds those kernels, too — Peano
-//! and the native `aiecc` as subprocesses, still no Python — from a design's
-//! MLIR.
+//! and the native `aiecc` as subprocesses — from a design's MLIR.
 //!
 //! The XRT types need the `xrt` feature (on by default), which compiles the
 //! shim and links XRT. With `default-features = false` the crate is plain

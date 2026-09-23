@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Replays the bundle [IRON](https://github.com/amd/IRON)'s GAIC exporter
 (`iron/applications/gaic/export_gaic.py`) writes. The GAIC (VGG16) backbone and first FC layer run on the NPU, the glue
-runs on the host, and there is no Python, PyTorch or ONNX at run time. The
+runs on the host. The
 library is std-only. The `gaic` binary adds image decoding and writing through
 the `image` crate (feature `cli`, on by default).
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Embeddable Rust runtime for the AdaFace IR face embedders: NPU
-//! convolutions + CPU glue/head, no Python.
+//! convolutions + CPU glue/head.
 //!
 //! [`IrEmbedder`] replays a bundle exported by
 //! `iron/applications/adaface_ir18/export_ir18.py` (or the IR-101 wrapper

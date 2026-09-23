@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Eugene Hauptmann, Nataliya Kosmyna (RLX)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Building IRON kernels from Rust, with no Python: the two compile steps
+//! Building IRON kernels from Rust: the two compile steps
 //! IRON's Python drives (`iron/common/compilation`) as plain subprocesses.
 //!
 //! - [`Toolchain::compile_kernel`]: an AIE core kernel (`aie_kernels/…/*.cc`)
@@ -23,7 +23,7 @@
 //!
 //! Adapted from RLX's `rlx-xdna/src/compile.rs`
 //! (<https://github.com/MIT-RLX/rlx>, MIT OR Apache-2.0), which found the
-//! native aiecc is all a Python-free build needs; the stale-output and
+//! native aiecc is all a build needs; the stale-output and
 //! link-object handling below come from there.
 
 use std::ffi::OsString;

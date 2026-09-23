@@ -6,8 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # taconite-adaface
 
 An **embeddable** Rust library, with no crates.io dependencies, that runs
-AdaFace IR face embedders (IR-18, IR-101) on the AIE NPU with no Python at
-inference time. It replays a *bundle* — compiled conv kernels, packed
+AdaFace IR face embedders (IR-18, IR-101) on the AIE NPU. It replays a *bundle* — compiled conv kernels, packed
 weights, and the network's steps in order, in the format every IRON bundle
 shares (read with the std-only
 [`taconite-bundle`](https://crates.io/crates/taconite-bundle)) — exported

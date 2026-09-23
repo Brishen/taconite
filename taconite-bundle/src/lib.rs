@@ -5,7 +5,7 @@
 //!
 //! IRON compiles ahead of time: an exporter (`iron/common/bundle.py` has the
 //! writer side) builds every NPU kernel a model needs and writes a bundle
-//! directory a Rust runtime replays with no Python:
+//! directory a Rust runtime replays:
 //!
 //! ```text
 //! manifest.txt   one record a line: `<tag> <field>...`; a field `k=v` is

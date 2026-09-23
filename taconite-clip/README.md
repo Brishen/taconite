@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # `taconite-clip` — CLIP ViT-H/14 on the NPU, from Rust
 
-A zero-Python runtime for
+A Rust runtime for
 [`laion/CLIP-ViT-H-14-laion2B-s32B-b79K`](https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K):
 image and text embeddings and zero-shot classification, with both
 transformers on the AMD XDNA NPU (NPU2) through IRON kernels replayed with
