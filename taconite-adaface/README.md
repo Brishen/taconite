@@ -16,6 +16,22 @@ ahead of time by [IRON](https://github.com/amd/IRON)'s
 AOT compiler). IRON's `run_ir18` / `run_ir101` binaries are thin CLI
 wrappers over this crate.
 
+Kernels run through [`taconite`](https://crates.io/crates/taconite), over
+either of its two NPU paths:
+
+- **XRT** (the default `xrt` feature): builds against XRT's headers and
+  library.
+- **Direct** (`direct` feature): straight to the `amdxdna` kernel driver's
+  ioctls on `/dev/accel/accel0`. It needs no XRT to build or run, and it
+  gives the same embeddings as XRT at the same speed. It takes precedence
+  when both features are on.
+
+```toml
+taconite-adaface = { version = "0.1", default-features = false, features = ["direct"] }
+```
+
+`taconite_adaface::BACKEND` names the path a build uses.
+
 Prebuilt NPU2 bundles are on Hugging Face:
 [`brishen/iron-adaface-ir18-npu2`](https://huggingface.co/brishen/iron-adaface-ir18-npu2)
 and
@@ -55,11 +71,11 @@ bad bundles, or exits the host process.
 
 `IrEmbedder::load` reads every weight into RAM and checks every step against
 them (a malformed bundle fails here, naming the manifest line). The first
-`embed()` creates one XRT hardware context per distinct conv kernel (16 for
+`embed()` creates one hardware context per distinct conv kernel (16 for
 IR-18/IR-101 — exactly the NPU2's concurrent-context cap); the session keeps
 them all resident, so **every
-later forward reloads nothing** (measured: IR-18 ~0.15 s, IR-101 ~0.31 s
-warm). This is the whole point of the runtime — so:
+later forward reloads nothing** (measured on NPU2, either path: IR-18
+~0.2 s, IR-101 ~0.5 s warm). This is the whole point of the runtime — so:
 
 - Construct **one** `IrEmbedder` per process and reuse it. A second
   simultaneous session fights over the 16-context cap and forces reloads.
@@ -67,17 +83,20 @@ warm). This is the whole point of the runtime — so:
   share it behind a `Mutex`. Forwards are serialized either way — the NPU
   path is one hardware queue.
 
-`TACONITE_TIMING=1` makes the shim print context/BO/run timing at session
-close; `TACONITE_CTX_CACHE` overrides the resident-context cap (default 16).
+`TACONITE_TIMING=1` prints load/run timing and cache hits/evictions when
+the embedder drops; `TACONITE_CTX_CACHE` overrides the resident-context cap
+(default 16).
 
 ### Build requirements
 
-- **XRT** headers/libs at `$XRT_ROOT` (default `/opt/xilinx/xrt`) and `g++`
-  at build time: this crate's `build.rs` compiles the bundled C++ shim
-  (`iron_xrt_shim.cpp`, one `xrt::hw_context` LRU) and links
-  `libxrt_coreutil`. Its only dependency is the std-only
-  `taconite-bundle`, and it needs no build dependencies.
-- At link time the flags propagate to your binary automatically. The
+- **Direct** (`--no-default-features --features direct`): nothing beyond
+  Rust. No XRT, no C++ step, no rpath.
+- **XRT** (the default): XRT headers/libs at `$XRT_ROOT` (default
+  `/opt/xilinx/xrt`) and `g++` at build time — `taconite`'s `build.rs`
+  compiles its C++ shim and links `libxrt_coreutil`. Both dependencies
+  (`taconite`, `taconite-bundle`) are std-only, and nothing needs build
+  dependencies.
+- With XRT, the link flags propagate to your binary automatically. The
   **rpath does not** (cargo drops `rustc-link-arg` across crates): either
   run with XRT's `setup.sh` sourced (`LD_LIBRARY_PATH`), or emit the rpaths
   in your own `build.rs` — `$ORIGIN/lib` for the portable layout below,
@@ -101,6 +120,10 @@ close; `TACONITE_CTX_CACHE` overrides the resident-context cap (default 16).
   binary and pass its path to `IrEmbedder::load`.
 
 ### Portable deployment (no XRT install on the target)
+
+The simplest route is the `direct` feature: the binary links only glibc
+and `libgcc_s`, so it and the bundle are the whole deployment. For an XRT
+build, read on.
 
 Static linking of XRT is not possible with stock XRT: the NPU backend
 (`libxrt_driver_xdna.so`, from the amd/xdna-driver repo) is shared-only and
@@ -142,7 +165,8 @@ basics (glibc, `libstdc++`, `libuuid`).
 | `input_dims() / embed_dim() / model() / num_conv_dispatches()` | bundle properties |
 | `cosine(a, b)` | embedding similarity |
 | `cli(net_name)` | the whole `run_ir*` CLI, built on the API above |
-| `Error` | `Io` / `Plan` / `Xrt` / `Input` |
+| `BACKEND` | the NPU path this build uses: `"xrt"` or `"direct"` |
+| `Error` | `Io` / `Plan` / `Xrt` (an NPU error on either path) / `Input` |
 
 ## Correctness
 

@@ -36,14 +36,13 @@ covers its build, usage, accuracy and speed.
   and the build has no C++ step. It gives the same results as XRT at the same
   speed.
 
-`taconite`, `taconite-sam3`, `taconite-clip` and `taconite-gaic` support
-both. For an XRT-free build of a model crate, use:
+Every crate supports both. For an XRT-free build of a model crate, use:
 
 ```bash
 cargo build --release --no-default-features --features cli,direct
 ```
 
-`taconite-adaface` runs through XRT only.
+(`taconite-adaface` is a library with no `cli` feature: `--features direct`.)
 
 ## Bundles
 

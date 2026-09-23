@@ -28,15 +28,19 @@
 //! ```
 //!
 //! Loading reads every weight into RAM and checks every step against them.
-//! The first forward creates one XRT hardware context per distinct conv
-//! kernel (16 for IR-18/IR-101) and the session keeps them ALL resident (LRU
-//! cache in the C++ shim, sized to the NPU2's 16-concurrent-context cap), so
-//! every later forward reloads nothing. Keep ONE `IrEmbedder` alive for the
-//! process and reuse it; a second simultaneous session would fight over the
-//! context cap.
+//! The first forward creates one hardware context per distinct conv kernel
+//! (16 for IR-18/IR-101) and the session keeps them ALL resident (an LRU
+//! cache sized to the NPU2's 16-concurrent-context cap), so every later
+//! forward reloads nothing. Keep ONE `IrEmbedder` alive for the process and
+//! reuse it; a second simultaneous session would fight over the context cap.
+//!
+//! Kernels run through [`taconite`]: over XRT (feature `xrt`, the default),
+//! or straight through the amdxdna driver's ioctls with no XRT at all
+//! (feature `direct`, which wins when both are on; build with
+//! `--no-default-features --features direct`). [`BACKEND`] says which.
 //!
 //! Pipeline per forward (all in Rust):
-//!   * every convolution on the NPU via the XRT shim, in the Conv2d
+//!   * every convolution on the NPU, in the Conv2d
 //!     channel-tiled [H, C/8, W, 8] bf16 layout; wide convs are summed over
 //!     input-channel groups sized to fit L1, and the width%4 stages (14x14 /
 //!     7x7) zero-pad the input width to a multiple of 4 and crop the extra
@@ -53,12 +57,27 @@
 //! deliberately not `Sync` -- all methods take `&mut self`, one forward at a
 //! time. Share it behind a `Mutex` if several threads need embeddings.
 
-use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use taconite_bundle::{DType, Manifest, Record, Store};
+// The NPU path: XRT (feature `xrt`, the default), or the driver's ioctls
+// with no XRT (feature `direct`, which wins when both are on).
+#[cfg(feature = "direct")]
+use taconite::direct::{Buffer, Kernel, Session};
+#[cfg(all(feature = "xrt", not(feature = "direct")))]
+use taconite::{Buffer, Kernel, Session};
+#[cfg(not(any(feature = "xrt", feature = "direct")))]
+compile_error!("no NPU path: enable feature `xrt` (the default) or `direct`");
+
+/// Which NPU path this build runs kernels through: `"xrt"` or `"direct"`.
+pub const BACKEND: &str = if cfg!(feature = "direct") {
+    "direct"
+} else {
+    "xrt"
+};
 
 /// The bundle format version this runtime reads (`export_ir18.VERSION`).
 pub const BUNDLE_VERSION: u32 = 1;
@@ -76,7 +95,8 @@ pub enum Error {
     /// The bundle is malformed or inconsistent: a bad manifest record, a
     /// missing or mis-sized tensor, a step reading an undefined buffer.
     Plan(String),
-    /// The XRT shim reported a device/kernel error.
+    /// The NPU runtime (XRT, or the amdxdna driver with feature `direct`)
+    /// reported a device/kernel error. Named for the crate's first backend.
     Xrt(String),
     /// The caller-supplied input tensor has the wrong shape.
     Input(String),
@@ -87,7 +107,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(p, e) => write!(f, "cannot read {}: {e}", p.display()),
             Error::Plan(s) => write!(f, "bad bundle: {s}"),
-            Error::Xrt(s) => write!(f, "XRT: {s}"),
+            Error::Xrt(s) => write!(f, "NPU ({BACKEND}): {s}"),
             Error::Input(s) => write!(f, "bad input: {s}"),
         }
     }
@@ -105,57 +125,64 @@ impl From<taconite_bundle::Error> for Error {
 }
 
 // ----------------------------------------------------------------------------
-// FFI to the XRT shim (persistent session; LRU cache of resident hw_contexts)
+// NPU session: taconite kernels behind an LRU cache of resident contexts
 // ----------------------------------------------------------------------------
 
-#[repr(C)]
-struct Session {
-    _p: [u8; 0],
+/// Resident conv kernels, most-recently-used first. A taconite [`Kernel`]
+/// holds its hardware context until dropped, so evicting one frees a slot
+/// of the driver's concurrent-context cap (16 on NPU2 -- exactly the IR
+/// networks' distinct conv kernels, so a forward that fits reloads nothing
+/// after the first).
+struct Npu {
+    session: Session,
+    cache: VecDeque<Resident>,
+    cap: usize,
+    timing: Option<NpuTiming>,
 }
 
-extern "C" {
-    fn iron_xrt_open(device_index: c_int, err: *mut c_char, err_len: usize) -> *mut Session;
-    fn iron_xrt_load(
-        s: *mut Session,
-        key: *const c_char,
-        xclbin: *const c_char,
-        insts: *const c_char,
-        kernel: *const c_char,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn iron_xrt_run_conv(
-        s: *mut Session,
-        key: *const c_char,
-        input: *const c_void,
-        in_bytes: usize,
-        weights: *const c_void,
-        wt_bytes: usize,
-        out: *mut c_void,
-        out_bytes: usize,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn iron_xrt_close(s: *mut Session);
+struct Resident {
+    key: String,
+    kernel: Kernel,
+    /// (input, weights, output) argument buffers, reused across runs.
+    args: Option<[Buffer; 3]>,
 }
 
-struct Xrt {
-    s: *mut Session,
-    err: Vec<i8>,
+/// `TACONITE_TIMING` instrumentation, printed when the session drops.
+#[derive(Default)]
+struct NpuTiming {
+    load: Duration,
+    run: Duration,
+    wait: Duration,
+    loads: usize,
+    hits: usize,
+    evictions: usize,
+    runs: usize,
 }
 
-impl Xrt {
-    fn open() -> Result<Xrt, Error> {
-        let mut err = vec![0i8; 512];
-        let s = unsafe { iron_xrt_open(0, err.as_mut_ptr() as *mut c_char, 512) };
-        if s.is_null() {
-            return Err(Error::Xrt(format!("open failed: {}", err_str(&err))));
-        }
-        Ok(Xrt { s, err })
+/// NPU2's concurrent hardware-context limit for these col8 kernels.
+const DEFAULT_CTX_CACHE: usize = 16;
+
+impl Npu {
+    fn open() -> Result<Npu, Error> {
+        let session = Session::open(0).map_err(npu_err("open"))?;
+        let cap = std::env::var("TACONITE_CTX_CACHE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &usize| v >= 1)
+            .unwrap_or(DEFAULT_CTX_CACHE);
+        let timing = std::env::var_os("TACONITE_TIMING").map(|_| NpuTiming::default());
+        Ok(Npu {
+            session,
+            cache: VecDeque::new(),
+            cap,
+            timing,
+        })
     }
 
-    /// Ensure `key`'s kernel is resident (no-op if already cached; otherwise
-    /// created, evicting the LRU context if the cache is full).
+    /// Ensure `key`'s kernel is resident (promoted to most-recently-used if
+    /// it already is); otherwise load it, evicting least-recently-used
+    /// kernels while the cache is full or the driver refuses another
+    /// context.
     fn ensure(
         &mut self,
         key: &str,
@@ -163,28 +190,46 @@ impl Xrt {
         insts: &Path,
         kernel: &str,
     ) -> Result<(), Error> {
-        let ck = cstr(key)?;
-        let cx = cstr(xclbin.to_str().ok_or_else(|| bad_path(xclbin))?)?;
-        let ci = cstr(insts.to_str().ok_or_else(|| bad_path(insts))?)?;
-        let cn = cstr(kernel)?;
-        let rc = unsafe {
-            iron_xrt_load(
-                self.s,
-                ck.as_ptr(),
-                cx.as_ptr(),
-                ci.as_ptr(),
-                cn.as_ptr(),
-                self.err.as_mut_ptr() as *mut c_char,
-                512,
-            )
+        if let Some(i) = self.cache.iter().position(|r| r.key == key) {
+            let r = self.cache.remove(i).expect("position is in range");
+            self.cache.push_front(r);
+            if let Some(t) = &mut self.timing {
+                t.hits += 1;
+            }
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        let mut evicted = 0;
+        while self.cache.len() >= self.cap {
+            self.cache.pop_back();
+            evicted += 1;
+        }
+        let kernel = loop {
+            match self.session.load_kernel(xclbin, insts, Some(kernel), 0) {
+                Ok(k) => break k,
+                Err(e) => {
+                    if self.cache.pop_back().is_none() {
+                        return Err(npu_err(&format!("load({key})"))(e));
+                    }
+                    evicted += 1;
+                }
+            }
         };
-        if rc != 0 {
-            return Err(Error::Xrt(format!("load({key}): {}", err_str(&self.err))));
+        self.cache.push_front(Resident {
+            key: key.to_string(),
+            kernel,
+            args: None,
+        });
+        if let Some(t) = &mut self.timing {
+            t.load += t0.elapsed();
+            t.loads += 1;
+            t.evictions += evicted;
         }
         Ok(())
     }
 
-    /// Run a kernel with the (input, weights, output) ABI (Conv2d or GEMM).
+    /// Run the resident kernel `key` with the (input, weights, output) ABI
+    /// (Conv2d or GEMM).
     fn run(
         &mut self,
         key: &str,
@@ -192,50 +237,60 @@ impl Xrt {
         weights: &[u16],
         out_len: usize,
     ) -> Result<Vec<u16>, Error> {
-        let ck = cstr(key)?;
-        let mut out = vec![0u16; out_len];
-        let rc = unsafe {
-            iron_xrt_run_conv(
-                self.s,
-                ck.as_ptr(),
-                input.as_ptr() as *const c_void,
-                input.len() * 2,
-                weights.as_ptr() as *const c_void,
-                weights.len() * 2,
-                out.as_mut_ptr() as *mut c_void,
-                out.len() * 2,
-                self.err.as_mut_ptr() as *mut c_char,
-                512,
-            )
-        };
-        if rc != 0 {
-            return Err(Error::Xrt(format!("run({key}): {}", err_str(&self.err))));
+        let t0 = Instant::now();
+        let err = npu_err(key);
+        let r = self
+            .cache
+            .iter_mut()
+            .find(|r| r.key == key)
+            .ok_or_else(|| Error::Xrt(format!("{key}: kernel not loaded")))?;
+        let sizes = [input.len(), weights.len(), out_len];
+        if r.args
+            .as_ref()
+            .map(|a| a.each_ref().map(|b| b.len_bytes() / 2))
+            != Some(sizes)
+        {
+            let s = &self.session;
+            r.args = Some([
+                s.alloc_of::<u16>(sizes[0]).map_err(&err)?,
+                s.alloc_of::<u16>(sizes[1]).map_err(&err)?,
+                s.alloc_of::<u16>(sizes[2]).map_err(&err)?,
+            ]);
+        }
+        let [a, w, c] = r.args.as_mut().expect("allocated above");
+        a.write(input).map_err(&err)?;
+        w.write(weights).map_err(&err)?;
+        let wait = r.kernel.run(&[a, w, c]).map_err(&err)?;
+        c.sync_from_device().map_err(&err)?;
+        let out = c.as_slice::<u16>().to_vec();
+        if let Some(t) = &mut self.timing {
+            t.run += t0.elapsed();
+            t.wait += wait;
+            t.runs += 1;
         }
         Ok(out)
     }
 }
 
-impl Drop for Xrt {
+impl Drop for Npu {
     fn drop(&mut self) {
-        unsafe { iron_xrt_close(self.s) };
+        if let Some(t) = &self.timing {
+            eprintln!(
+                "[{BACKEND}] loads={} hits={} evict={} runs={}  load={:.2}s run={:.2}s (wait={:.2}s)",
+                t.loads,
+                t.hits,
+                t.evictions,
+                t.runs,
+                t.load.as_secs_f64(),
+                t.run.as_secs_f64(),
+                t.wait.as_secs_f64()
+            );
+        }
     }
 }
 
-fn cstr(s: &str) -> Result<CString, Error> {
-    CString::new(s).map_err(|_| Error::Plan(format!("string contains NUL: {s}")))
-}
-
-fn bad_path(p: &Path) -> Error {
-    Error::Plan(format!("non-UTF-8 path: {}", p.display()))
-}
-
-fn err_str(buf: &[i8]) -> String {
-    let b: Vec<u8> = buf
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    String::from_utf8_lossy(&b).into_owned()
+fn npu_err(what: &str) -> impl Fn(taconite::Error) -> Error + '_ {
+    move |e| Error::Xrt(format!("{what}: {e}"))
 }
 
 // ----------------------------------------------------------------------------
@@ -685,7 +740,7 @@ fn parse_steps(m: &Manifest, store: &Store) -> Result<Vec<Step>, Error> {
 /// per face. The first forward creates the hardware contexts; every later
 /// forward reuses them (warm path).
 pub struct IrEmbedder {
-    xrt: Xrt,
+    npu: Npu,
     store: Store,
     steps: Vec<Step>,
     /// Each head's `bT`, widened to f32 once.
@@ -697,11 +752,13 @@ pub struct IrEmbedder {
     embed_dim: usize,
 }
 
-// SAFETY: the session pointer owns a heap object in the C++ shim with no
-// thread-affine state (XRT device/context handles may be used from any
-// thread), and every method takes &mut self, so calls are serialized. The
-// type is deliberately NOT Sync: wrap it in a Mutex to share across threads.
-unsafe impl Send for IrEmbedder {}
+// Send but deliberately not Sync (taconite's session, kernels and buffers
+// are both): every method takes &mut self; wrap it in a Mutex to share
+// across threads.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<IrEmbedder>()
+};
 
 impl IrEmbedder {
     /// Read and check the bundle (manifest, every tensor), then open the NPU
@@ -744,7 +801,7 @@ impl IrEmbedder {
             return Err(Error::Plan("the bundle's last step is not a head".into()));
         }
         Ok(IrEmbedder {
-            xrt: Xrt::open()?,
+            npu: Npu::open()?,
             store,
             steps,
             head_bt,
@@ -821,23 +878,23 @@ impl IrEmbedder {
 
     fn run(&mut self, input: Option<&[u16]>) -> Result<Vec<f32>, Error> {
         let Self {
-            xrt,
+            npu,
             store,
             steps,
             head_bt,
             ..
         } = self;
-        forward(xrt, store, steps, head_bt, input)
+        forward(npu, store, steps, head_bt, input)
     }
 }
 
 /// One forward pass over the parsed steps. NPU convs dispatch through the
-/// resident-context session `xrt`; the per-channel glue and residual add run
+/// resident-context session `npu`; the per-channel glue and residual add run
 /// on the host. `input` overrides the input step's recorded tensor with a
 /// caller-built tiled buffer. Every buffer a step reads exists (checked at
 /// load), so the `bufs[..]` lookups cannot fail.
 fn forward(
-    xrt: &mut Xrt,
+    npu: &mut Npu,
     store: &Store,
     steps: &[Step],
     head_bt: &HashMap<String, Vec<f32>>,
@@ -874,9 +931,9 @@ fn forward(
             }
             Step::Conv(cv) => {
                 let (oc, oh, ow, owp) = (cv.oc, cv.oh, cv.ow, cv.owp);
-                xrt.ensure(&cv.ctx, &cv.xclbin, &cv.insts, &cv.kernel)?;
+                npu.ensure(&cv.ctx, &cv.xclbin, &cv.insts, &cv.kernel)?;
                 let inp = slice_groups_wpad(&bufs[&cv.input], cv.c0, cv.icg / 8, cv.wp);
-                let part = xrt.run(&cv.ctx, &inp, store.bf16(&cv.wt)?, oc * oh * owp)?;
+                let part = npu.run(&cv.ctx, &inp, store.bf16(&cv.wt)?, oc * oh * owp)?;
                 let a = acc
                     .entry(cv.out)
                     .or_insert_with(|| vec![0f32; oc * oh * owp]);

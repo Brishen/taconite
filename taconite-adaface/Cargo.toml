@@ -6,7 +6,7 @@ name = "taconite-adaface"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Embeddable Rust runtime replaying exported AdaFace IR bundles on an AMD XDNA NPU via XRT"
+description = "Embeddable Rust runtime replaying exported AdaFace IR bundles on an AMD XDNA NPU, through XRT or directly through the amdxdna driver"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/Brishen/taconite"
@@ -16,19 +16,30 @@ categories = ["computer-vision", "science"]
 # rpath link-arg does not propagate across crates; see build.rs).
 links = "taconite_adaface"
 
-# No external crates: build.rs compiles the C++ XRT shim with g++, and the
-# code uses std plus the std-only bundle reader. Builds offline.
+[features]
+default = ["xrt"]
+# Run the kernels through XRT (taconite's `xrt` feature: XRT's headers and
+# library at build time).
+xrt = ["taconite/xrt"]
+# Run the kernels through the amdxdna driver's ioctls (`taconite::direct`)
+# instead of XRT; it wins when both are on. For a build with no XRT at all:
+# `--no-default-features --features direct`.
+direct = []
 
 [lib]
 name = "taconite_adaface"
 path = "src/lib.rs"
 
+# Both std-only; taconite's build.rs drives g++ for its XRT shim itself, so
+# the crate builds offline.
 [dependencies]
 taconite-bundle = { version = "0.1.0", path = "../taconite-bundle" }
+taconite = { version = "0.1.0", path = "../taconite", default-features = false }
 
-# docs.rs has no XRT; build.rs skips the shim there.
+# docs.rs has no XRT; taconite's build.rs skips the shim there.
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
 
 [profile.release]
 opt-level = 3
