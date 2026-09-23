@@ -3,7 +3,7 @@
 
 [package]
 name = "taconite-adaface"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Embeddable Rust runtime replaying exported AdaFace IR bundles on an AMD XDNA NPU, through XRT or directly through the amdxdna driver"
