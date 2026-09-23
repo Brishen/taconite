@@ -15,7 +15,9 @@ Python app (`iron/applications/sam3`), stage for stage.
 
 A prebuilt NPU2 bundle is on Hugging Face:
 [`brishen/iron-sam3-npu2`](https://huggingface.co/brishen/iron-sam3-npu2)
-(`hf download brishen/iron-sam3-npu2 --local-dir sam3`).
+(`hf download brishen/iron-sam3-npu2 --local-dir sam3`). It is bundle
+format 2, which this version (0.1.1) reads along with format 1; 0.1.0
+reads format 1 only (`--revision bundle-v1`).
 
 ```bash
 sam3 segment <bundle> photo.jpg "person" -o overlay.png

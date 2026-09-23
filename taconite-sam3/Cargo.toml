@@ -3,7 +3,7 @@
 
 [package]
 name = "taconite-sam3"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "SAM3 (Segment Anything 3) text-prompted segmentation on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"

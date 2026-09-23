@@ -15,7 +15,12 @@ pub use taconite_bundle::{DType, Entry, Store, Xclbin};
 
 use crate::Error;
 
-pub const VERSION: u32 = 1;
+/// The bundle format this runtime writes; it also reads [`OLDEST_VERSION`]
+/// and up. 2: the device ViT's residual stream is f32 (`vit_res_f32`), which
+/// a 1-only reader would mis-size -- hence a new version, so an older runtime
+/// refuses the bundle rather than miscomputing.
+pub const VERSION: u32 = 2;
+pub const OLDEST_VERSION: u32 = 1;
 
 /// One compiled `flm.GEMM`: `C[M, N] = A[M, K] B[K, N]` (+ bias), A rows
 /// `lda` apart (overlapping when `lda < K`), B pre-packed (`b_bytes`).
@@ -118,7 +123,10 @@ pub fn unescape(s: &str) -> String {
 
 impl Manifest {
     pub fn load(dir: &Path) -> Result<Self, Error> {
-        let base = taconite_bundle::Manifest::load(dir, VERSION)?;
+        let base = (OLDEST_VERSION..=VERSION)
+            .rev()
+            .find_map(|v| taconite_bundle::Manifest::load(dir, v).ok())
+            .map_or_else(|| taconite_bundle::Manifest::load(dir, VERSION), Ok)?;
         let mut m = Manifest {
             dir: dir.to_path_buf(),
             base: base.clone(),
