@@ -17,12 +17,14 @@ from Rust.
 
 | Crate | What it does |
 | --- | --- |
-| [`taconite`](taconite) | The core: loads and runs IRON kernels (`Session` / `Kernel` / `Buffer` / `Run`), and builds them with Peano and `aiecc` (`compile`) |
+| [`taconite`](taconite) | The core: loads and runs IRON kernels (`Session` / `Kernel` / `Buffer` / `Run`), and builds them with Peano and `aiecc` (`compile`); Python-exact `json` / `unicode` helpers for model front ends |
 | [`taconite-bundle`](taconite-bundle) | Reads the bundle format every IRON exporter writes (`manifest.txt`, `tensors.txt` / `tensors.bin`); std-only |
 | [`taconite-sam3`](taconite-sam3) | SAM 3 text-prompted instance segmentation (`sam3` binary) |
 | [`taconite-clip`](taconite-clip) | CLIP ViT-H/14 image and text embeddings, zero-shot classification (`clip` binary) |
 | [`taconite-gaic`](taconite-gaic) | GAIC (VGG16) image cropping (`gaic` binary) |
 | [`taconite-adaface`](taconite-adaface) | AdaFace IR-18 / IR-101 face embeddings, an embeddable library |
+| [`taconite-qwen35`](taconite-qwen35) | Qwen3.5-2B chat: a hybrid Gated DeltaNet / attention LLM, prefill GEMMs and decode GEMVs on the NPU (`qwen35` binary) |
+| [`taconite-embeddinggemma2`](taconite-embeddinggemma2) | EmbeddingGemma 2 image embeddings in its shared text / image space (`embeddinggemma2` binary) |
 
 Each crate is its own package (there is no workspace); each one's README
 covers its build, usage, accuracy and speed.
@@ -52,6 +54,10 @@ Prebuilt NPU2 bundles are on Hugging Face:
 - SAM 3: [`brishen/iron-sam3-npu2`](https://huggingface.co/brishen/iron-sam3-npu2)
 - AdaFace: [`brishen/iron-adaface-ir18-npu2`](https://huggingface.co/brishen/iron-adaface-ir18-npu2),
   [`brishen/iron-adaface-ir101-npu2`](https://huggingface.co/brishen/iron-adaface-ir101-npu2)
+- CLIP ViT-H/14: [`brishen/iron-clip-vit-h14-npu2`](https://huggingface.co/brishen/iron-clip-vit-h14-npu2)
+- GAIC: [`brishen/iron-gaic-vgg16-npu2`](https://huggingface.co/brishen/iron-gaic-vgg16-npu2)
+- Qwen3.5-2B: [`brishen/iron-qwen3.5-2b-npu2`](https://huggingface.co/brishen/iron-qwen3.5-2b-npu2)
+- EmbeddingGemma 2: [`brishen/iron-embeddinggemma2-npu2`](https://huggingface.co/brishen/iron-embeddinggemma2-npu2)
 
 ## Requirements
 

@@ -59,6 +59,14 @@ mod ffi {
             err: *mut c_char,
             err_len: usize,
         ) -> *mut iron_buffer;
+        pub fn iron_kernel_set_insts_words(
+            k: *mut iron_kernel,
+            idx: *const u32,
+            vals: *const u32,
+            n: usize,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> c_int;
         pub fn iron_kernel_run(
             k: *mut iron_kernel,
             bufs: *mut *mut iron_buffer,
@@ -228,6 +236,31 @@ impl Kernel {
             return Err(Error::Run(err_string(&err)));
         }
         Ok(Duration::from_nanos(elapsed_ns))
+    }
+
+    /// Rewrites 32-bit words of the instruction stream: word `i` becomes `v`
+    /// for each `(i, v)` -- a run-time parameter the stream writes (an MHA's
+    /// valid key count, say) changed between launches, with no second
+    /// stream. Every later launch runs the rewritten stream.
+    pub fn set_insts_words(&self, words: &[(usize, u32)]) -> Result<(), Error> {
+        let idx: Vec<u32> = words.iter().map(|&(i, _)| i as u32).collect();
+        let vals: Vec<u32> = words.iter().map(|&(_, v)| v).collect();
+        let mut err = err_buf();
+        // SAFETY: raw is a live kernel; idx / vals hold n words; err is ERR_LEN bytes.
+        let rc = unsafe {
+            ffi::iron_kernel_set_insts_words(
+                self.raw.as_ptr(),
+                idx.as_ptr(),
+                vals.as_ptr(),
+                idx.len(),
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Kernel(err_string(&err)));
+        }
+        Ok(())
     }
 
     /// Launches without waiting. The returned [`Run`] borrows the argument

@@ -3,7 +3,7 @@
 
 [package]
 name = "taconite-clip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "CLIP ViT-H/14 image and text embeddings / zero-shot classification on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
@@ -28,9 +28,9 @@ direct = ["taconite-sam3/direct"]
 
 [dependencies]
 taconite-bundle = { version = "0.1.0", path = "../taconite-bundle" }
-taconite = { version = "0.1.0", path = "../taconite", default-features = false }
+taconite = { version = "0.1.1", path = "../taconite", default-features = false }
 # the CLIP BPE tokenizer and the threaded host-math helpers
-taconite-sam3 = { version = "0.1.0", path = "../taconite-sam3", default-features = false }
+taconite-sam3 = { version = "0.1.3", path = "../taconite-sam3", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 
 [[bin]]

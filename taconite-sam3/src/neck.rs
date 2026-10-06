@@ -22,6 +22,8 @@ use taconite::bf16_to_f32;
 use crate::cpu::{gelu_bf16, par_rows};
 use crate::npu::pull;
 use crate::{Error, Sam3, gemm, narrow};
+#[cfg(feature = "gpu")]
+use crate::{gemm_dev, npu::Io};
 
 impl Sam3 {
     /// 3x3 conv, pad 1: `x [side, side, C]` (bf16) -> `conv(x) + bias`
@@ -75,6 +77,22 @@ impl Sam3 {
     /// The backbone's `[T, 1024]` (raster) -> FPN levels 0-2, channels-last
     /// f32: `[288^2, 256]`, `[144^2, 256]`, `[72^2, 256]`.
     pub fn neck(&mut self, vit: &[f32]) -> Result<[Vec<f32>; 3], Error> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            self.neck_gpu(Some(vit))?;
+            let g = self.cfg.grid;
+            let fpn = &self.gpu().glue.fpn;
+            let n = |s: usize| s * s * self.cfg.d_model;
+            return Ok([fpn[0].read(n(4 * g)), fpn[1].read(n(2 * g)), fpn[2].read(n(g))]);
+        }
+        self.neck_host(vit, "n")
+    }
+
+    /// The neck with its glue on the host, weights `<prefix>.in`,
+    /// `<prefix>.up`, `<prefix>.conv<i>` (+ `.b`): `n` the detector's, `tn`
+    /// the tracker's (same kernels). Each level is `[side^2, width]` with
+    /// width the bias's (the 3x3 kernel's output channels).
+    pub(crate) fn neck_host(&mut self, vit: &[f32], prefix: &str) -> Result<[Vec<f32>; 3], Error> {
         let cfg = self.cfg.clone();
         let (g, t) = (cfg.grid, cfg.tokens());
         let (s0, s1, s2) = (cfg.neck_splits[0], cfg.neck_splits[1], cfg.neck_splits[2]);
@@ -83,7 +101,7 @@ impl Sam3 {
         let mut vb = vec![0u16; vit.len()];
         narrow(vit, &mut vb);
         self.io.n_in.set_a(&vb)?;
-        gemm(&mut self.npu, &self.io.n_in, &self.w["n.in"], &mut self.timing)?;
+        gemm(&mut self.npu, &self.io.n_in, &self.w[&format!("{prefix}.in")], &mut self.timing)?;
         let t0 = std::time::Instant::now();
         let y = self.io.n_in.get_c(t)?;
         let y = &y[..];
@@ -120,7 +138,7 @@ impl Sam3 {
         }
         self.io.n_up.set_a(&a0)?;
         self.timing.add("neck_gelu_shuffle", t0.elapsed());
-        gemm(&mut self.npu, &self.io.n_up, &self.w["n.up"], &mut self.timing)?;
+        gemm(&mut self.npu, &self.io.n_up, &self.w[&format!("{prefix}.up")], &mut self.timing)?;
         let t0 = std::time::Instant::now();
         let up = self.io.n_up.get_c(4 * t)?;
         let n_up = self.npu.spec("n_up")?.n;
@@ -137,11 +155,43 @@ impl Sam3 {
             });
         }
         self.timing.add("neck_up_shuffle", t0.elapsed());
-        let b: Vec<Vec<f32>> =
-            (0..3).map(|i| self.store.f32(&format!("n.conv{i}.b")).map(<[f32]>::to_vec)).collect::<Result<_, _>>()?;
-        let f0 = self.conv3x3(&u0, 4 * g, "n.conv0", &b[0])?;
-        let f1 = self.conv3x3(&u1, 2 * g, "n.conv1", &b[1])?;
-        let f2 = self.conv3x3(&u2, g, "n.conv2", &b[2])?;
+        let b: Vec<Vec<f32>> = (0..3)
+            .map(|i| self.store.f32(&format!("{prefix}.conv{i}.b")).map(<[f32]>::to_vec))
+            .collect::<Result<_, _>>()?;
+        let f0 = self.conv3x3(&u0, 4 * g, &format!("{prefix}.conv0"), &b[0])?;
+        let f1 = self.conv3x3(&u1, 2 * g, &format!("{prefix}.conv1"), &b[1])?;
+        let f2 = self.conv3x3(&u2, g, &format!("{prefix}.conv2"), &b[2])?;
         Ok([f0, f1, f2])
+    }
+
+    /// The neck in NPU+GPU mode, from the host's `vit` or (`None`) the
+    /// NPU's: the FPN levels end up in the GPU's `glue.fpn`.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn neck_gpu(&mut self, vit: Option<&[f32]>) -> Result<(), Error> {
+        let g = self.cfg.grid;
+        match vit {
+            Some(v) => {
+                let mut vb = vec![0u16; v.len()];
+                narrow(v, &mut vb);
+                self.io.n_in.set_a(&vb)?;
+            }
+            None => {
+                let gpu = self.gpu.as_ref().expect("NPU+GPU mode");
+                let plan =
+                    gpu.glue.vit_in.as_ref().ok_or_else(|| Error::Bundle("the bundle has no device ViT".into()))?;
+                gpu.run(plan, "vit_in", &mut self.timing)?;
+            }
+        }
+        let gpu = self.gpu.as_ref().expect("NPU+GPU mode");
+        let (npu, io, w, t) = (&mut self.npu, &self.io, &self.w, &mut self.timing);
+        gemm_dev(npu, &io.n_in, &w["n.in"], t)?;
+        gpu.run(&gpu.glue.neck_mid, "neck_mid", t)?;
+        gemm_dev(npu, &io.n_up, &w["n.up"], t)?;
+        gpu.run(&gpu.glue.neck_up, "neck_up", t)?;
+        for (i, side) in [4 * g, 2 * g, g].into_iter().enumerate() {
+            let cio: &Io = &io.conv[&side];
+            gemm_dev(npu, cio, &w[&format!("n.conv{i}")], t)?;
+        }
+        gpu.run(&gpu.glue.neck_out, "neck_out", t)
     }
 }

@@ -22,8 +22,8 @@ use std::time::Instant;
 
 use taconite_bundle::{Manifest, Store};
 use npu::Buffer;
-pub use taconite_sam3::Timing;
-use taconite_sam3::cpu::{dot, ln_row, par_rows};
+pub use taconite::Timing;
+use taconite::cpu::{dot, ln_row, par_rows};
 use taconite_sam3::tokenizer::Tokenizer;
 
 pub mod npu;

@@ -3,7 +3,7 @@
 
 [package]
 name = "taconite-gaic"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "GAIC (Grid Anchor based Image Cropping, VGG16) on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"

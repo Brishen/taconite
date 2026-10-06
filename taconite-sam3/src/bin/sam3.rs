@@ -7,12 +7,19 @@
 //!
 //! `sam3 segment <bundle> <image> <prompt> [-o overlay.png] [--threshold T]
 //! [--reps N] [--threads N]` -- segment every instance of `prompt`.
+//!
+//! `sam3 points <bundle> <image> <x,y[,label];...> [--box x1,y1,x2,y2]
+//! [--single] [-o overlay.png]` -- segment the object at the clicks (SAM's
+//! three candidate masks, or one with `--single`).
+//!
+//! Both take `--mode npu|npu+gpu` (default: `SAM3_MODE`, else `npu`): the
+//! work between the NPU's kernels on the CPU, or on the GPU (feature `gpu`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use taconite_sam3::{Instance, Output, Sam3, Text, instances, preprocess};
+use taconite_sam3::{Instance, Mode, Output, PointPrompt, Sam3, Text, instances, point_mask, preprocess};
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -67,10 +74,10 @@ fn ref_text(m: &Sam3) -> R<Text> {
     })
 }
 
-fn check(dir: &Path) -> R<bool> {
+fn check(dir: &Path, mode: Mode) -> R<bool> {
     let t0 = Instant::now();
-    let mut m = Sam3::load(dir)?;
-    println!("loaded {} ({:.1} s)", dir.display(), t0.elapsed().as_secs_f64());
+    let mut m = Sam3::load_mode(dir, mode)?;
+    println!("loaded {} ({:.1} s); mode {} on {}", dir.display(), t0.elapsed().as_secs_f64(), m.mode(), m.devices());
     let mut c = Checks { failed: vec![] };
     let cfg = m.cfg.clone();
     let (d, t) = (cfg.d_model, cfg.tokens());
@@ -168,6 +175,23 @@ fn check(dir: &Path) -> R<bool> {
     c.check("DETR decoder logits", ld < 0.1, format!("max |diff| {ld:.4} over {} confident queries", conf.len()));
     let pr = st.f32("ref.presence")?[0];
     c.check("presence", (dec.presence - pr).abs() < 0.05, format!("{:.4} vs {pr:.4}", dec.presence));
+    if m.mode() == Mode::NpuGpu && !m.use_gpu(false) {
+        // the GPU decoder against the CPU one, on the same inputs
+        let t1 = Instant::now();
+        let cpu = m.detr_decoder(&renc, &rtext)?;
+        let ms = t1.elapsed().as_secs_f64() * 1e3;
+        m.use_gpu(true);
+        let max_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        let hd = max_diff(&dec.hidden, &cpu.hidden);
+        let bd = max_diff(&dec.boxes, &cpu.boxes);
+        let ld = max_diff(&dec.logits, &cpu.logits);
+        let pd = (dec.presence - cpu.presence).abs();
+        c.check(
+            "DETR decoder, GPU vs CPU",
+            hd < 1e-2 && bd < 1e-3 && ld < 1e-2 && pd < 1e-2,
+            format!("max |diff| hidden {hd:.2e}, boxes {bd:.2e}, logits {ld:.2e}, presence {pd:.2e} (CPU {ms:.0} ms)"),
+        );
+    }
 
     let t1 = Instant::now();
     let (masks, semantic) = m.mask_decoder(&rh, &rfpn, &renc, &rtext)?;
@@ -220,12 +244,195 @@ fn check(dir: &Path) -> R<bool> {
         );
     }
     let _ = t;
+    if m.has_points() {
+        check_points(&mut m, &mut c)?;
+    }
     if c.failed.is_empty() {
         println!("ALL CHECKS PASSED");
     } else {
         println!("FAILED: {}", c.failed.join(", "));
     }
     Ok(c.failed.is_empty())
+}
+
+/// The point prompt path: its stages on the reference's inputs, then the
+/// bundle's point cases end to end.
+fn check_points(m: &mut Sam3, c: &mut Checks) -> R<()> {
+    println!("point prompts, each stage on the float32 reference's inputs:");
+    let rvit = m.store.f32("ref.trk.vit_out")?.to_vec();
+    let t1 = Instant::now();
+    let emb = m.tracker_neck(&rvit)?;
+    let ms = t1.elapsed().as_secs_f64() * 1e3;
+    for (i, level) in [&emb.s0, &emb.s1, &emb.emb].into_iter().enumerate() {
+        let cos = cosine(level, m.store.f32(&format!("ref.trk.emb{i}"))?);
+        c.check(&format!("tracker neck level {i}"), cos > 0.995, format!("cosine {cos:.6} ({ms:.0} ms all)"));
+    }
+    let st = &m.store;
+    let pts: Vec<[f32; 2]> = st.f32("ref.trk.points")?.chunks(2).map(|p| [p[0], p[1]]).collect();
+    let labels = st.i32("ref.trk.labels")?.to_vec();
+    let sparse = m.prompt_tokens(&pts, &labels, None)?;
+    let d = max_abs(&sparse, st.f32("ref.trk.sparse")?);
+    c.check("prompt encoder", d < 1e-4, format!("max |diff| {d:.2e}"));
+    let remb = taconite_sam3::ImageEmbedding {
+        s0: st.f32("ref.trk.emb0")?.to_vec(),
+        s1: st.f32("ref.trk.emb1")?.to_vec(),
+        emb: st.f32("ref.trk.emb2")?.to_vec(),
+    };
+    for (key, multi) in [("multi", true), ("single", false)] {
+        let t1 = Instant::now();
+        let out = m.decode_points(&remb, &sparse, multi)?;
+        let ms = t1.elapsed().as_secs_f64() * 1e3;
+        let st = &m.store;
+        let cos = cosine(&out.masks, st.f32(&format!("ref.trk.{key}.masks"))?);
+        let id = max_abs(&out.iou, st.f32(&format!("ref.trk.{key}.iou"))?);
+        let od = (out.object_score - st.f32("ref.trk.obj")?[0]).abs();
+        c.check(
+            &format!("mask decoder, {key}mask"),
+            cos > 0.9999 && id < 1e-3 && od < 1e-2,
+            format!("masks cosine {cos:.6}, max |IoU diff| {id:.2e}, |object diff| {od:.2e} ({ms:.0} ms)"),
+        );
+    }
+
+    println!("end to end (image file + points / box -> masks) against the reference cases:");
+    let size = m.cfg.image_size;
+    for case in m.manifest.point_cases.clone() {
+        let prompt = PointPrompt::parse_case(&case.prompt)?;
+        let (rgb, w, h) = load_rgb(&case.image)?;
+        m.timing.clear();
+        let t1 = Instant::now();
+        let emb = m.embed_image(&preprocess(&rgb, w, h, size))?;
+        let t2 = Instant::now();
+        let out = m.predict_points(&emb, &prompt, w, h, true)?;
+        let t3 = Instant::now();
+        let st = &m.store;
+        let rm = st.u8(&format!("pcase.{}.masks", case.idx))?;
+        let riou = st.f32(&format!("pcase.{}.iou", case.idx))?;
+        let ious: Vec<f64> =
+            (0..out.n).map(|i| iou(&point_mask(&out, i, w, h), &rm[i * w * h..(i + 1) * w * h])).collect();
+        // the best candidate and any the model rates well, judged strictly;
+        // a low-rated one has an ambiguous edge that swings with the
+        // image's decoding (image crate vs PIL) and the NPU's rounding
+        let best = (0..out.n).max_by(|&a, &b| riou[a].total_cmp(&riou[b])).unwrap_or(0);
+        let ok = (0..out.n).all(|i| ious[i] > if i == best || riou[i] >= 0.85 { 0.98 } else { 0.85 });
+        let id = max_abs(&out.iou, riou);
+        let name = format!("{} / {}", case.image.file_name().unwrap().to_string_lossy(), case.prompt);
+        c.check(
+            &name,
+            ok && id < 0.03,
+            format!(
+                "mask IoU vs ref {:?}, max |IoU score diff| {id:.3}; image {:.0} ms ({}), prompt {:.0} ms",
+                ious.iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>(),
+                (t2 - t1).as_secs_f64() * 1e3,
+                m.timing,
+                (t3 - t2).as_secs_f64() * 1e3
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// `sam3 points <bundle> <image> <x,y[,label];...> [--box x1,y1,x2,y2]`
+fn points(args: &[String], mode: Mode) -> R<()> {
+    let (dir, img, spec) = (Path::new(&args[0]), Path::new(&args[1]), &args[2]);
+    let mut out_path: Option<PathBuf> = None;
+    let mut bbox: Option<String> = None;
+    let mut reps = 1usize;
+    let mut single = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--single" => {
+                single = true;
+                i += 1;
+                continue;
+            }
+            "-o" => out_path = Some(PathBuf::from(&args[i + 1])),
+            "--box" => bbox = Some(args[i + 1].clone()),
+            "--reps" => reps = args[i + 1].parse()?,
+            "--threads" => taconite_sam3::cpu::set_threads(args[i + 1].parse()?),
+            a => return Err(format!("unknown argument {a}").into()),
+        }
+        i += 2;
+    }
+    let prompt = PointPrompt::parse(spec, bbox.as_deref())?;
+    let t0 = Instant::now();
+    let mut m = Sam3::load_mode(dir, mode)?;
+    println!("loaded {} ({:.1} s); mode {} on {}", dir.display(), t0.elapsed().as_secs_f64(), m.mode(), m.devices());
+    let (rgb, w, h) = load_rgb(img)?;
+    let mut emb = None;
+    for r in 0..reps {
+        m.timing.clear();
+        let t1 = Instant::now();
+        emb = Some(m.embed_image(&preprocess(&rgb, w, h, m.cfg.image_size))?);
+        let (loads, evictions) = m.contexts();
+        println!(
+            "image {r}: {:.0} ms ({}; contexts loaded {loads}, evicted {evictions})",
+            t1.elapsed().as_secs_f64() * 1e3,
+            m.timing
+        );
+    }
+    let emb = emb.unwrap();
+    let t1 = Instant::now();
+    let out = m.predict_points(&emb, &prompt, w, h, !single)?;
+    println!("prompt: {:.0} ms (host)", t1.elapsed().as_secs_f64() * 1e3);
+    println!("object score {:.2} ({})", out.object_score, if out.object_score > 0.0 { "object" } else { "no object" });
+    let best = out.best();
+    let mut masks = Vec::new();
+    for i in 0..out.n {
+        let mask = point_mask(&out, i, w, h);
+        let area = mask.iter().filter(|&&v| v).count();
+        println!("  mask {i}: predicted IoU {:.3}, {area} px{}", out.iou[i], if i == best { "  <- best" } else { "" });
+        masks.push(mask);
+    }
+    if let Some(p) = out_path {
+        point_overlay(&rgb, w, h, &masks[best], &prompt, &p)?;
+        println!("wrote {}", p.display());
+    }
+    Ok(())
+}
+
+fn point_overlay(rgb: &[u8], w: usize, h: usize, mask: &[bool], prompt: &PointPrompt, path: &Path) -> R<()> {
+    let mut img = rgb.to_vec();
+    let col = [30u16, 144, 255];
+    for (p, &on) in mask.iter().enumerate() {
+        if on {
+            for ch in 0..3 {
+                img[p * 3 + ch] = ((img[p * 3 + ch] as u16 + col[ch]) / 2) as u8;
+            }
+        }
+    }
+    let r = (w.min(h) / 150).max(4) as i64;
+    for (pt, &l) in prompt.points.iter().zip(&prompt.labels) {
+        let dot = if l == 1 { [0u8, 255, 0] } else { [255, 0, 0] };
+        let (cx, cy) = (pt[0] as i64, pt[1] as i64);
+        for y in cy - r..=cy + r {
+            for x in cx - r..=cx + r {
+                if (x - cx).pow(2) + (y - cy).pow(2) <= r * r
+                    && (0..w as i64).contains(&x)
+                    && (0..h as i64).contains(&y)
+                {
+                    img[(y as usize * w + x as usize) * 3..][..3].copy_from_slice(&dot);
+                }
+            }
+        }
+    }
+    if let Some(b) = prompt.bbox {
+        let [x0, y0, x1, y1] = b.map(|v| v.round().max(0.0) as usize);
+        let (x1, y1) = (x1.min(w - 1), y1.min(h - 1));
+        let green = [0u8, 255, 0];
+        for x in x0..=x1 {
+            for y in [y0, y1] {
+                img[(y * w + x) * 3..][..3].copy_from_slice(&green);
+            }
+        }
+        for y in y0..=y1 {
+            for x in [x0, x1] {
+                img[(y * w + x) * 3..][..3].copy_from_slice(&green);
+            }
+        }
+    }
+    image::RgbImage::from_raw(w as u32, h as u32, img).ok_or("overlay size")?.save(path)?;
+    Ok(())
 }
 
 fn overlay(rgb: &[u8], w: usize, h: usize, inst: &[Instance], path: &Path) -> R<()> {
@@ -264,7 +471,7 @@ fn overlay(rgb: &[u8], w: usize, h: usize, inst: &[Instance], path: &Path) -> R<
     Ok(())
 }
 
-fn segment(args: &[String]) -> R<()> {
+fn segment(args: &[String], mode: Mode) -> R<()> {
     let (dir, img, prompt) = (Path::new(&args[0]), Path::new(&args[1]), &args[2]);
     let mut out_path: Option<PathBuf> = None;
     let mut threshold = 0.5f32;
@@ -281,8 +488,8 @@ fn segment(args: &[String]) -> R<()> {
         i += 2;
     }
     let t0 = Instant::now();
-    let mut m = Sam3::load(dir)?;
-    println!("loaded {} ({:.1} s)", dir.display(), t0.elapsed().as_secs_f64());
+    let mut m = Sam3::load_mode(dir, mode)?;
+    println!("loaded {} ({:.1} s); mode {} on {}", dir.display(), t0.elapsed().as_secs_f64(), m.mode(), m.devices());
     let (rgb, w, h) = load_rgb(img)?;
     let mut out: Option<Output> = None;
     for r in 0..reps {
@@ -347,7 +554,22 @@ fn bench_copy() -> R<()> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = match args.iter().position(|a| a == "--mode") {
+        Some(i) if i + 1 < args.len() => {
+            let m = Mode::parse(&args[i + 1]);
+            args.drain(i..i + 2);
+            m
+        }
+        _ => Mode::from_env(),
+    };
+    let mode = match mode {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     if args.first().map(String::as_str) == Some("bench-copy") {
         return match bench_copy() {
             Ok(()) => ExitCode::SUCCESS,
@@ -358,11 +580,12 @@ fn main() -> ExitCode {
         };
     }
     let r = match args.first().map(String::as_str) {
-        Some("check") if args.len() == 2 => check(Path::new(&args[1])).map(|ok| ok as u8),
-        Some("segment") if args.len() >= 4 => segment(&args[1..]).map(|_| 1),
+        Some("check") if args.len() == 2 => check(Path::new(&args[1]), mode).map(|ok| ok as u8),
+        Some("segment") if args.len() >= 4 => segment(&args[1..], mode).map(|_| 1),
+        Some("points") if args.len() >= 4 => points(&args[1..], mode).map(|_| 1),
         _ => {
             eprintln!(
-                "usage: sam3 check <bundle>\n       sam3 segment <bundle> <image> <prompt> [-o overlay.png] [--threshold 0.5] [--reps N] [--threads N]"
+                "usage: sam3 check <bundle> [--mode npu|npu+gpu]\n       sam3 segment <bundle> <image> <prompt> [-o overlay.png] [--threshold 0.5] [--reps N] [--threads N] [--mode npu|npu+gpu]\n       sam3 points <bundle> <image> <x,y[,label];...> [--box x1,y1,x2,y2] [--single] [-o overlay.png] [--reps N] [--threads N]\n                   (image pixels; label 1 = object, 0 = background; \"\" for a box alone)"
             );
             return ExitCode::from(2);
         }

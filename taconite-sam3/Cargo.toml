@@ -3,10 +3,10 @@
 
 [package]
 name = "taconite-sam3"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.85"
-description = "SAM3 (Segment Anything 3) text-prompted segmentation on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
+description = "SAM3 (Segment Anything 3) text-, point- and box-prompted segmentation on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
 license = "Apache-2.0 AND BSD-3-Clause AND MIT-CMU"
 readme = "README.md"
 repository = "https://github.com/Brishen/taconite"
@@ -25,10 +25,16 @@ xrt = ["taconite/xrt"]
 # instead of XRT; it wins when both are on. For a build with no XRT at all:
 # `--no-default-features --features cli,direct`.
 direct = []
+# The `npu+gpu` mode (`--mode npu+gpu` / SAM3_MODE): the work between the
+# NPU's kernels and the DETR decoder's query layers on the iGPU (Vulkan,
+# through RADV), over the NPU's buffers in place through dma-bufs; needs
+# `direct`. libvulkan is loaded at run time, and only in that mode: the
+# default `npu` mode runs as without the feature.
+gpu = ["direct", "taconite/gpu"]
 
 [dependencies]
 taconite-bundle = { version = "0.1.0", path = "../taconite-bundle" }
-taconite = { version = "0.1.0", path = "../taconite", default-features = false }
+taconite = { version = "0.1.1", path = "../taconite", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 
 [[bin]]

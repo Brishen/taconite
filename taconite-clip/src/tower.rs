@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use taconite_bundle::Store;
 use taconite::{bf16_to_f32, f32_to_bf16};
-use taconite_sam3::Timing;
-use taconite_sam3::cpu::{ln_row, par_rows};
+use taconite::Timing;
+use taconite::cpu::{ln_row, par_rows};
 
 use crate::npu::{BF16, Buffer, Io, Npu};
 use crate::{Error, pull, push};

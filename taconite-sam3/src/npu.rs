@@ -56,6 +56,8 @@ pub struct Npu {
     cap: usize,
     pub gemms: HashMap<String, GemmSpec>,
     pub mhas: HashMap<String, MhaSpec>,
+    /// instruction words to rewrite in a kernel whenever it loads
+    patches: HashMap<String, Vec<(usize, u32)>>,
 }
 
 /// A GEMM's operands for a given row count: `a` (rows `lda` apart) and `c`,
@@ -170,6 +172,7 @@ impl Npu {
             cap: std::env::var("SAM3_MAX_CONTEXTS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX),
             gemms: m.gemms.clone(),
             mhas: m.mhas.clone(),
+            patches: HashMap::new(),
         };
         order.sort();
         for key in order {
@@ -190,6 +193,9 @@ impl Npu {
         let s = &self.sources[key];
         let k = self.session.load_kernel(&s.xclbin, &s.insts, Some(&s.name), s.ops)?;
         let ctx = s.ctx.clone();
+        if let Some(words) = self.patches.get(key) {
+            k.set_insts_words(words)?;
+        }
         self.loaded.insert(key.to_string(), k);
         if !self.lru.contains(&ctx) {
             self.lru.push(ctx);
@@ -223,6 +229,23 @@ impl Npu {
             self.lru.push(c);
         }
         Ok(&self.loaded[key])
+    }
+
+    /// Rewrites words of kernel `key`'s instruction stream, now and every
+    /// time the kernel is loaded again (after an eviction).
+    pub fn patch_insts(&mut self, key: &str, words: Vec<(usize, u32)>) -> Result<(), Error> {
+        if let Some(k) = self.loaded.get(key) {
+            k.set_insts_words(&words).map_err(|e| Error::Npu(format!("{key}: {e}")))?;
+        }
+        self.patches.insert(key.to_string(), words);
+        Ok(())
+    }
+
+    /// The instruction stream of kernel `key`, as the bundle has it.
+    pub fn insts(&self, key: &str) -> Result<Vec<u32>, Error> {
+        let s = self.sources.get(key).ok_or_else(|| Error::Bundle(format!("no kernel {key}")))?;
+        let b = std::fs::read(&s.insts).map_err(|e| Error::Bundle(format!("{}: {e}", s.insts.display())))?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     }
 
     pub fn spec(&self, key: &str) -> Result<&GemmSpec, Error> {

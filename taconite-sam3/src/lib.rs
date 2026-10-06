@@ -18,8 +18,17 @@
 //! | DETR decoder, 6 layers | all six layers' vision keys/values (one GEMM) | the 201-query layers, box refinement, scoring (`detr.rs`) |
 //! | mask decoder | pixel-decoder 3x3s, folded mask head, prompt cross-attention | GroupNorms, upsampling (`mask.rs`) |
 //!
+//! That is [`Mode::Npu`]. In [`Mode::NpuGpu`] (feature `gpu`) the host
+//! column's glue and the decoder's query layers run on the iGPU instead,
+//! over the NPU's buffers in place (`gpu/`).
+//!
 //! [`Sam3::segment`] is the whole thing; the stage methods are public so
 //! `sam3 check` can test each on the bundle's reference inputs.
+//!
+//! Point and box prompts (SAM's clicks, bundles with the tracker head):
+//! [`Sam3::embed_image`] runs the ViT and the tracker's FPN neck on the NPU
+//! once per image, then [`Sam3::predict_points`] answers each
+//! [`PointPrompt`] on the host in tens of milliseconds (`tracker.rs`).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,8 +38,9 @@ use std::time::{Duration, Instant};
 use npu::Buffer;
 
 pub mod bundle;
-pub mod cpu;
 mod detr;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 mod mask;
 mod neck;
 pub mod npu;
@@ -38,11 +48,17 @@ pub mod pack;
 pub mod post;
 mod text;
 pub mod tokenizer;
+mod tracker;
 mod vit;
 
+/// The threaded host math and [`Timing`], from `taconite` (re-exported:
+/// they used to live here).
+pub use taconite::{Timing, cpu};
+
 pub use detr::Decoded;
-pub use post::{Instance, instances, preprocess};
+pub use post::{Instance, instances, preprocess, upsample_threshold};
 pub use text::Text;
+pub use tracker::{ImageEmbedding, PointOutput, PointPrompt, point_mask};
 
 use bundle::{Manifest, Store};
 use npu::{Io, MhaIo, Npu};
@@ -53,6 +69,8 @@ pub enum Error {
     Bundle(String),
     Npu(String),
     Input(String),
+    /// Vulkan or a shader (feature `gpu`).
+    Gpu(String),
 }
 
 impl fmt::Display for Error {
@@ -61,6 +79,7 @@ impl fmt::Display for Error {
             Error::Bundle(m) => write!(f, "bundle: {m}"),
             Error::Npu(m) => write!(f, "NPU: {m}"),
             Error::Input(m) => write!(f, "input: {m}"),
+            Error::Gpu(m) => write!(f, "GPU: {m}"),
         }
     }
 }
@@ -75,51 +94,10 @@ impl From<taconite_bundle::Error> for Error {
 
 impl From<taconite::Error> for Error {
     fn from(e: taconite::Error) -> Self {
-        Error::Npu(e.to_string())
-    }
-}
-
-/// Wall time per stage, in first-seen order; NPU dispatch time is kept
-/// under `npu:<kernel>`.
-#[derive(Default, Debug, Clone)]
-pub struct Timing {
-    entries: Vec<(String, Duration)>,
-}
-
-impl Timing {
-    pub fn add(&mut self, key: &str, d: Duration) {
-        match self.entries.iter_mut().find(|(k, _)| k == key) {
-            Some((_, t)) => *t += d,
-            None => self.entries.push((key.to_string(), d)),
+        match e {
+            taconite::Error::Gpu(m) => Error::Gpu(m),
+            e => Error::Npu(e.to_string()),
         }
-    }
-
-    pub fn get(&self, key: &str) -> Duration {
-        self.entries.iter().find(|(k, _)| k == key).map_or(Duration::ZERO, |e| e.1)
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn npu_total(&self) -> Duration {
-        self.entries.iter().filter(|(k, _)| k.starts_with("npu:")).map(|e| e.1).sum()
-    }
-}
-
-impl fmt::Display for Timing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ms = |d: &Duration| d.as_secs_f64() * 1e3;
-        let (npu, host): (Vec<_>, Vec<_>) = self.entries.iter().partition(|(k, _)| k.starts_with("npu:"));
-        write!(f, "stages:")?;
-        for (k, d) in &host {
-            write!(f, " {k} {:.0}", ms(d))?;
-        }
-        write!(f, " ms; npu {:.0} ms:", ms(&self.npu_total()))?;
-        for (k, d) in &npu {
-            write!(f, " {} {:.0}", &k[4..], ms(d))?;
-        }
-        Ok(())
     }
 }
 
@@ -248,12 +226,65 @@ pub struct Sam3 {
     slots: HashMap<String, Buffer>,
     io: Ios,
     pub timing: Timing,
+    mode: Mode,
+    /// NPU+GPU mode's device, plans and GPU-resident activations
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu::Gpu>,
+    /// in NPU+GPU mode, the DETR decoder's query layers on the GPU (see
+    /// `use_gpu`)
+    #[cfg(feature = "gpu")]
+    gpu_dec: bool,
+}
+
+/// Where the work between the NPU's kernels runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// On the CPU: the NPU-only path (the default).
+    Npu,
+    /// On the iGPU (feature `gpu`), reading and writing the NPU's buffers in
+    /// place: the glue between kernels, and the DETR decoder's query layers.
+    NpuGpu,
+}
+
+impl Mode {
+    /// `npu` or `npu+gpu`.
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        match s {
+            "npu" => Ok(Mode::Npu),
+            "npu+gpu" | "npu-gpu" => Ok(Mode::NpuGpu),
+            _ => Err(Error::Input(format!("mode {s:?}: expected npu or npu+gpu"))),
+        }
+    }
+
+    /// `SAM3_MODE`, or [`Mode::Npu`] when it is unset.
+    pub fn from_env() -> Result<Self, Error> {
+        match std::env::var("SAM3_MODE") {
+            Ok(v) if !v.is_empty() => Mode::parse(&v),
+            _ => Ok(Mode::Npu),
+        }
+    }
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Mode::Npu => "npu",
+            Mode::NpuGpu => "npu+gpu",
+        })
+    }
 }
 
 impl Sam3 {
     /// Loads the bundle, opens the NPU, loads every kernel and uploads the
-    /// packed weights.
+    /// packed weights, in the mode `SAM3_MODE` names ([`Mode::Npu`] if
+    /// unset).
     pub fn load(dir: &Path) -> Result<Self, Error> {
+        Self::load_mode(dir, Mode::from_env()?)
+    }
+
+    /// [`load`](Self::load) in `mode`. [`Mode::NpuGpu`] needs the `gpu`
+    /// feature and a usable GPU; [`Mode::Npu`] never touches the GPU.
+    pub fn load_mode(dir: &Path, mode: Mode) -> Result<Self, Error> {
         let manifest = Manifest::load(dir)?;
         let store = Store::load(dir)?;
         let cfg = Config::from(&manifest)?;
@@ -264,7 +295,9 @@ impl Sam3 {
             manifest.usize("pad")? as u32,
             cfg.text_len,
         )?;
-        let npu = Npu::open(&manifest)?;
+        // mutable for NPU+GPU mode's instruction patches
+        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+        let mut npu = Npu::open(&manifest)?;
         let mut w = HashMap::new();
         let mut names = vec!["v.embed".to_string(), "n.in".into(), "n.up".into(), "dec.kv".into()];
         for i in 0..cfg.vit_layers {
@@ -286,6 +319,11 @@ impl Sam3 {
         if cfg.vit_device {
             names.push("v.rope_tab.win".into());
             names.push("v.rope_tab.glob".into());
+        }
+        // the point prompt path's neck (tracker.rs), on the same kernels
+        if manifest.param("tracker").is_ok_and(|v| v == "1") {
+            names.extend(["tn.in", "tn.up"].map(String::from));
+            names.extend((0..3).map(|i| format!("tn.conv{i}")));
         }
         for n in names {
             let b = npu.upload(store.bytes(&n)?)?;
@@ -338,7 +376,60 @@ impl Sam3 {
                 vec![]
             },
         };
-        Ok(Sam3 { manifest, store, cfg, tokenizer, npu, w, slots, io, timing: Timing::default() })
+        #[cfg(feature = "gpu")]
+        let gpu = match mode {
+            Mode::NpuGpu => Some(gpu::Gpu::new(&store, &cfg, &mut npu, &io)?),
+            Mode::Npu => None,
+        };
+        #[cfg(not(feature = "gpu"))]
+        if mode == Mode::NpuGpu {
+            return Err(Error::Input("npu+gpu mode needs the `gpu` feature".into()));
+        }
+        Ok(Sam3 {
+            manifest,
+            store,
+            cfg,
+            tokenizer,
+            npu,
+            w,
+            slots,
+            io,
+            timing: Timing::default(),
+            mode,
+            #[cfg(feature = "gpu")]
+            gpu,
+            #[cfg(feature = "gpu")]
+            gpu_dec: true,
+        })
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The hardware the mode runs on: `NPU`, or `NPU + GPU (<device>)`.
+    pub fn devices(&self) -> String {
+        #[cfg(feature = "gpu")]
+        if let Some(g) = &self.gpu {
+            return format!("NPU + GPU ({})", g.vk.name);
+        }
+        "NPU".to_string()
+    }
+
+    /// In NPU+GPU mode, runs the DETR decoder's query layers on the GPU
+    /// (`on`, the default) or on the CPU (to compare the two); true if they
+    /// are now on the GPU.
+    pub fn use_gpu(&mut self, on: bool) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu_dec = on && self.gpu.is_some();
+            self.gpu_dec
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = on;
+            false
+        }
     }
 
     /// Hardware contexts created and evicted so far (evictions happen when
@@ -359,25 +450,64 @@ impl Sam3 {
     /// runs on a side thread while the ViT has the NPU.
     pub fn segment(&mut self, pixels: &[f32], prompt: &str) -> Result<Output, Error> {
         let (ids, mask) = self.tokenizer.encode(prompt);
+        // NPU+GPU mode: the ViT's output stays on the NPU, the neck reads it
+        let readback = self.mode == Mode::Npu;
         if !self.cfg.vit_device {
             let text = self.time("text", |s| s.text(&ids, &mask))?;
             return self.forward(pixels, &text);
         }
-        let Sam3 { store, cfg, npu, io, w, timing, .. } = self;
+        // NPU+GPU mode also folds the prompt's cross-attention weights on the
+        // text thread, while the ViT has the NPU
+        let fold = !readback;
+        let specs = (self.npu.spec("d_s")?.clone(), self.npu.spec("d_c")?.clone());
+        let Sam3 { store, cfg, npu, io, w, timing, slots, .. } = self;
+        #[cfg(feature = "gpu")]
+        let gpu_gelu = self.gpu.as_ref().and_then(|g| g.glue.vit_gelu.as_ref().map(|p| (g, p)));
+        #[cfg(not(feature = "gpu"))]
+        let gpu_gelu: Option<((), ())> = None;
         let (text, vit) = std::thread::scope(|s| {
-            let encoder = s.spawn(|| {
+            let encoder = s.spawn(|| -> (Result<Text, Error>, Duration, Duration) {
                 let t0 = Instant::now();
                 let r = cpu::run_inline(|| text::encode(store, cfg, &ids, &mask));
-                (r, t0.elapsed())
+                let dt = t0.elapsed();
+                let t1 = Instant::now();
+                let r = r.and_then(|text| {
+                    if fold {
+                        cpu::run_inline(|| -> Result<(), Error> {
+                            for i in 0..cfg.d_layers {
+                                let (p, sl) = (format!("d.{i}.ca"), format!("d.{i}"));
+                                detr::fold_cross_into(store, cfg, (&specs.0, &specs.1), slots, &p, &sl, &text)?;
+                            }
+                            detr::fold_cross_into(store, cfg, (&specs.0, &specs.1), slots, "m.ca", "m", &text)
+                        })?;
+                    }
+                    Ok(text)
+                });
+                (r, dt, t1.elapsed())
             });
             let t0 = Instant::now();
-            let vit = vit::vit_device(npu, io, w, store, cfg, timing, pixels);
+            let mut after_fc1 = |t: &mut Timing| -> Result<(), Error> {
+                #[cfg(feature = "gpu")]
+                if let Some((g, plan)) = gpu_gelu {
+                    return g.run(plan, "vit_gelu", t);
+                }
+                let _ = (&gpu_gelu, t);
+                Ok(())
+            };
+            let vit = vit::vit_device(npu, io, w, store, cfg, timing, pixels, readback, &mut after_fc1);
             timing.add("vit", t0.elapsed());
-            let (text, dt) = encoder.join().expect("the text encoder thread");
+            let (text, dt, fold_dt) = encoder.join().expect("the text encoder thread");
             timing.add("text", dt);
+            if fold {
+                timing.add("prompt_fold (overlapped)", fold_dt);
+            }
             (text, vit)
         });
         let (text, vit) = (text?, vit?);
+        #[cfg(feature = "gpu")]
+        if !readback {
+            return self.finish_gpu(None, &text, true);
+        }
         self.finish(&vit, &text)
     }
 
@@ -389,11 +519,35 @@ impl Sam3 {
 
     /// The forward after the backbone.
     fn finish(&mut self, vit: &[f32], text: &Text) -> Result<Output, Error> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return self.finish_gpu(Some(vit), text, false);
+        }
         let fpn = self.time("neck", |s| s.neck(vit))?;
         let enc = self.time("detr_enc", |s| s.detr_encoder(&fpn[2], text))?;
         let dec = self.time("detr_dec", |s| s.detr_decoder(&enc, text))?;
         let (masks, semantic) = self.time("mask_dec", |s| s.mask_decoder(&dec.hidden, &fpn, &enc, text))?;
         Ok(Output { logits: dec.logits, boxes: dec.boxes, presence: dec.presence, masks, semantic })
+    }
+}
+
+impl Sam3 {
+    /// NPU+GPU mode's forward after the backbone: every stage's input and
+    /// output stays on the devices; `vit` is the backbone's output if the
+    /// host has it (otherwise the neck reads the NPU's).
+    #[cfg(feature = "gpu")]
+    fn finish_gpu(&mut self, vit: Option<&[f32]>, text: &Text, folded: bool) -> Result<Output, Error> {
+        self.time("neck", |s| s.neck_gpu(vit))?;
+        self.time("detr_enc", |s| s.detr_encoder_gpu(text, folded))?;
+        let dec = self.time("detr_dec", |s| s.detr_decoder_gpu(text))?;
+        let (masks, semantic) = self.time("mask_dec", |s| s.mask_decoder_gpu(&dec.hidden, text, folded))?;
+        Ok(Output { logits: dec.logits, boxes: dec.boxes, presence: dec.presence, masks, semantic })
+    }
+
+    /// The NPU+GPU mode's state (only called in that mode).
+    #[cfg(feature = "gpu")]
+    fn gpu(&self) -> &gpu::Gpu {
+        self.gpu.as_ref().expect("NPU+GPU mode")
     }
 }
 
@@ -434,3 +588,10 @@ pub(crate) fn narrow(src: &[f32], dst: &mut [u16]) {
         }
     });
 }
+
+// A model loads on one thread and runs on a worker (see `taconite`'s
+// types): it must stay `Send`, with the GPU decoder too.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<Sam3>();
+};

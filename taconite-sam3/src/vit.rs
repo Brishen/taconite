@@ -27,8 +27,25 @@ impl Sam3 {
     /// `pixels [3, S, S]` -> the backbone's last hidden state `[T, 1024]`,
     /// raster order.
     pub fn vit(&mut self, pixels: &[f32]) -> Result<Vec<f32>, Error> {
+        #[cfg(feature = "gpu")]
+        if self.cfg.vit_device && self.gpu.as_ref().is_some_and(|g| g.glue.vit_gelu.is_some()) {
+            let Sam3 { npu, io, w, store, cfg, timing, gpu, .. } = self;
+            let gpu = gpu.as_ref().expect("NPU+GPU mode");
+            let gelu = gpu.glue.vit_gelu.as_ref().expect("checked");
+            return vit_device(npu, io, w, store, cfg, timing, pixels, true, &mut |t| gpu.run(gelu, "vit_gelu", t));
+        }
         if self.cfg.vit_device {
-            return vit_device(&mut self.npu, &mut self.io, &self.w, &self.store, &self.cfg, &mut self.timing, pixels);
+            return vit_device(
+                &mut self.npu,
+                &mut self.io,
+                &self.w,
+                &self.store,
+                &self.cfg,
+                &mut self.timing,
+                pixels,
+                true,
+                &mut |_| Ok(()),
+            );
         }
         let c = self.cfg.clone();
         let (t, dim, g, ps, s) = (c.tokens(), c.vit_dim, c.grid, c.patch, c.image_size);
@@ -189,6 +206,8 @@ pub(crate) fn vit_device(
     cfg: &Config,
     timing: &mut Timing,
     pixels: &[f32],
+    readback: bool,
+    after_fc1: &mut dyn FnMut(&mut Timing) -> Result<(), Error>,
 ) -> Result<Vec<f32>, Error> {
     {
         let c = cfg;
@@ -276,8 +295,13 @@ pub(crate) fn vit_device(
             gemm_dev(npu, &io.v_o, &w[&p("o")], timing)?;
             op(npu, "addln", &[&io.xres[0], &io.v_o.c, &io.xres[1], &io.v_fc1.a], timing)?;
             gemm_dev(npu, &io.v_fc1, &w[&p("fc1")], timing)?;
+            after_fc1(timing)?;
             gemm_dev(npu, &io.v_fc2, &w[&p("fc2")], timing)?;
             op(npu, "addln", &[&io.xres[1], &io.v_fc2.c, &io.xres[0], &io.v_qkv.a], timing)?;
+        }
+        if !readback {
+            // the output stays in `xres[0]` (window order) for the GPU
+            return Ok(Vec::new());
         }
         let t1 = std::time::Instant::now();
         let xf: Vec<f32> = if c.vit_res_f32 {

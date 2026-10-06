@@ -369,6 +369,30 @@ void iron_buffer_free(iron_buffer *b)
     delete b;
 }
 
+int iron_kernel_set_insts_words(iron_kernel *k,
+                                const uint32_t *idx,
+                                const uint32_t *vals,
+                                size_t n,
+                                char *err,
+                                size_t err_len)
+{
+    try {
+        uint32_t *words = k->insts_bo.map<uint32_t *>();
+        for (size_t i = 0; i < n; ++i) {
+            if ((static_cast<size_t>(idx[i]) + 1) * 4 > k->insts_bytes) {
+                set_err(err, err_len, "instruction word " + std::to_string(idx[i]) + " is past the stream");
+                return 1;
+            }
+            words[idx[i]] = vals[i];
+        }
+        k->insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        return 0;
+    } catch (const std::exception &e) {
+        set_err(err, err_len, e.what());
+        return 1;
+    }
+}
+
 int iron_kernel_run(iron_kernel *k, iron_buffer **bufs, size_t n, uint64_t *elapsed_ns, char *err, size_t err_len)
 {
     if (!k) {

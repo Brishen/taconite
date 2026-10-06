@@ -78,6 +78,18 @@ iron_buffer *iron_buffer_sub(iron_buffer *parent, size_t offset, size_t bytes, c
  * referenced it. */
 int iron_kernel_run(iron_kernel *k, iron_buffer **bufs, size_t n, uint64_t *elapsed_ns, char *err, size_t err_len);
 
+/* Rewrite `n` 32-bit words of `k`'s instruction stream -- word `idx[i]`
+ * becomes `vals[i]` -- and sync it: a run-time parameter the stream writes
+ * (an MHA's key count, say) changed between launches, with no new stream.
+ * No launch of `k` may be in flight. Returns 0, or non-zero with err set
+ * (an index past the stream). */
+int iron_kernel_set_insts_words(iron_kernel *k,
+                                const uint32_t *idx,
+                                const uint32_t *vals,
+                                size_t n,
+                                char *err,
+                                size_t err_len);
+
 /* The same launch split in two, so the host can work while the array does:
  * `iron_kernel_start` submits and returns a run handle (NULL on failure);
  * `iron_run_wait` blocks until it completes, reports the state as

@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 
-use taconite::{bf16_to_f32, fast_exp};
+use crate::{bf16_to_f32, fast_exp};
 
 static THREADS: AtomicUsize = AtomicUsize::new(0);
 
@@ -101,7 +101,7 @@ impl Pool {
         for _ in 0..workers {
             let sh = Arc::clone(&shared);
             std::thread::Builder::new()
-                .name("taconite-sam3 worker".into())
+                .name("taconite worker".into())
                 .spawn(move || Self::work(&sh))
                 .expect("spawning a worker thread");
         }
@@ -797,7 +797,7 @@ pub fn attention_dec(
 #[inline(always)]
 fn gelu_bf16_impl<const F: bool>(src: &[u16], dst: &mut [u16]) {
     for (o, &v) in dst.iter_mut().zip(src) {
-        *o = taconite::f32_to_bf16(gelu(bf16_to_f32(v)));
+        *o = crate::f32_to_bf16(gelu(bf16_to_f32(v)));
     }
 }
 

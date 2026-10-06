@@ -87,6 +87,9 @@ pub struct Manifest {
     pub ref_prompt: Option<String>,
     pub tok_tests: Vec<(usize, String)>,
     pub cases: Vec<Case>,
+    /// point / box prompt cases (`pcase`, `pcase.<idx>.*` tensors); the
+    /// prompt is `points=<x,y[,l];...> box=<x1,y1,x2,y2>`
+    pub point_cases: Vec<Case>,
 }
 
 /// Python's `unicode_escape` of a prompt, undone (the escapes it writes for
@@ -137,6 +140,7 @@ impl Manifest {
             ref_prompt: None,
             tok_tests: Vec::new(),
             cases: Vec::new(),
+            point_cases: Vec::new(),
         };
         let name = |r: &taconite_bundle::Record| r.str("name").unwrap_or("MLIR_AIE").to_string();
         for r in base.records() {
@@ -190,6 +194,9 @@ impl Manifest {
                 "case" => {
                     r.field(2)?;
                     m.cases.push(Case { idx: r.field_as(0)?, image: dir.join(r.field(1)?), prompt: r.rest(2) });
+                }
+                "pcase" => {
+                    m.point_cases.push(Case { idx: r.field_as(0)?, image: dir.join(r.field(1)?), prompt: r.rest(2) });
                 }
                 _ => {}
             }

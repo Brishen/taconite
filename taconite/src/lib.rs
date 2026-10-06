@@ -20,6 +20,11 @@
 //! syncs around a run, so activations never take an extra copy on the way
 //! to or from the array.
 //!
+//! Std-only helpers for model front ends ported from Python sit alongside:
+//! [`json`] (Python's `json` module, as it reads and prints), [`unicode`]
+//! (Python's `unicodedata` and `str` predicates, plus the HF `tokenizers`
+//! variants) and [`pyre`] (Python's `re` matching).
+//!
 //! The `direct` module runs them with no XRT at all, through the `amdxdna`
 //! driver's ioctls. The [`compile`] module builds those kernels, too — Peano
 //! and the native `aiecc` as subprocesses — from a design's MLIR.
@@ -42,12 +47,21 @@ use std::fmt;
 use std::path::Path;
 
 pub mod compile;
+pub mod cpu;
+#[cfg(all(feature = "gpu", target_os = "linux", target_arch = "x86_64"))]
+pub mod gpu;
+pub mod json;
+pub mod pyre;
+mod timing;
+pub mod unicode;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod direct;
 #[cfg(feature = "xrt")]
 mod xrt;
 #[cfg(feature = "xrt")]
 pub use xrt::{Buffer, Kernel, Run, Session};
+
+pub use timing::Timing;
 
 /// What went wrong, in XRT's words where it has any.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +79,8 @@ pub enum Error {
     Path(String),
     /// A kernel or design failed to build (see [`compile`]).
     Compile(String),
+    /// The iGPU failed (feature `gpu`).
+    Gpu(String),
 }
 
 impl fmt::Display for Error {
@@ -76,6 +92,7 @@ impl fmt::Display for Error {
             Error::Run(m) => write!(f, "NPU run: {m}"),
             Error::Path(m) => write!(f, "path: {m}"),
             Error::Compile(m) => write!(f, "compile: {m}"),
+            Error::Gpu(m) => write!(f, "GPU: {m}"),
         }
     }
 }
@@ -128,6 +145,40 @@ pub fn fast_exp(x: f32) -> f32 {
     f32::from_bits(p.to_bits().wrapping_add((n as i32 as u32) << 23))
 }
 
+/// IEEE half precision as bits, rounded to nearest even (subnormals kept,
+/// out-of-range values to infinity): what a GPU's f16 cooperative matrices
+/// take. A bf16 value in f16's normal range (6.1e-5 to 65504) converts
+/// exactly.
+pub fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32;
+    let m = b & 0x7f_ffff;
+    if e == 0xff {
+        return sign | 0x7c00 | if m != 0 { 0x200 } else { 0 };
+    }
+    let e16 = e - 127 + 15;
+    if e16 >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e16 < -10 {
+        return sign;
+    }
+    // the kept bits (a subnormal: the implicit bit shifted in), and the
+    // dropped ones that round them
+    let (full, kept, shift) = if e16 <= 0 {
+        let full = m | 0x80_0000;
+        (full, full >> (14 - e16), (14 - e16) as u32)
+    } else {
+        (m, ((e16 as u32) << 10) | (m >> 13), 13)
+    };
+    let rem = full & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    // a carry out of the mantissa moves to the next exponent (or infinity)
+    let r = kept + u32::from(rem > half || (rem == half && kept & 1 == 1));
+    sign | r as u16
+}
+
 #[inline]
 pub fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
@@ -135,6 +186,27 @@ pub fn bf16_to_f32(b: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f16_rounding() {
+        use super::f32_to_f16;
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(-2.5), 0xc100);
+        assert_eq!(f32_to_f16(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16(65520.0), 0x7c00); // rounds up to infinity
+        assert_eq!(f32_to_f16(6.103_515_6e-5), 0x0400); // the smallest normal
+        assert_eq!(f32_to_f16(5.960_464_5e-8), 0x0001); // the smallest subnormal
+        assert_eq!(f32_to_f16(2.980_232_2e-8), 0x0000); // a tie, to even (0)
+        assert_eq!(f32_to_f16(1.0 + 1.0 / 2048.0), 0x3c00); // a tie, to even
+        assert_eq!(f32_to_f16(1.0 + 3.0 / 2048.0), 0x3c02); // a tie, to even (up)
+        // every bf16 value in f16's normal range converts exactly
+        for bits in 0x3880u16..0x4780 {
+            let x = super::bf16_to_f32(bits);
+            let h = f32_to_f16(x) as u32;
+            let back = f32::from_bits(((h & 0x3ff) << 13) | ((((h >> 10) & 0x1f) + 112) << 23));
+            assert_eq!(back, x, "{bits:#x}");
+        }
+    }
+
     use super::*;
 
     #[test]

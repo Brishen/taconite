@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "taconite-qwen35"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Qwen3.5-2B chat about text and images (hybrid Gated DeltaNet / attention LLM + ViT) on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
+license = "Apache-2.0 AND BSD-3-Clause AND MIT-CMU"
+readme = "README.md"
+repository = "https://github.com/Brishen/taconite"
+keywords = ["npu", "xdna", "qwen", "llm", "vision"]
+categories = ["science", "text-processing", "command-line-utilities"]
+
+[features]
+default = ["cli", "xrt"]
+# The `qwen35` binary: decodes images (the `image` crate). The library
+# itself takes RGB8 pixels.
+cli = ["dep:image"]
+# Run the kernels through XRT (taconite's `xrt` feature: XRT's headers and
+# library at build time).
+xrt = ["taconite/xrt"]
+# Run the kernels through the amdxdna driver's ioctls (`taconite::direct`)
+# instead of XRT; it wins when both are on. For a build with no XRT at all:
+# `--no-default-features --features cli,direct`.
+direct = []
+
+[dependencies]
+taconite-bundle = { version = "0.1.0", path = "../taconite-bundle" }
+taconite = { version = "0.1.1", path = "../taconite", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+
+[[bin]]
+name = "qwen35"
+required-features = ["cli"]
+
+[[example]]
+name = "vision"
+required-features = ["cli"]
+
+[[example]]
+name = "gemm_probe"
+
+# docs.rs has no XRT; taconite's build.rs skips the shim there.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+
+[profile.release]
+debug = 1

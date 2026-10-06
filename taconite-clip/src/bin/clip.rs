@@ -63,7 +63,7 @@ fn classify(args: &[String]) -> R<()> {
                 i += 1;
             }
             "--threads" => {
-                taconite_sam3::cpu::set_threads(args[i + 1].parse()?);
+                taconite::cpu::set_threads(args[i + 1].parse()?);
                 i += 1;
             }
             a => images.push(PathBuf::from(a)),

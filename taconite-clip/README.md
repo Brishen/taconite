@@ -117,8 +117,8 @@ the records `export_clip.py`'s docstring lists.
 
 - Batches are fixed at export (4 images, 8 prompts a pass); a smaller
   request still runs the full pass.
-- The tokenizer and host math come from the `taconite-sam3` crate; a shared
-  runtime-helpers crate would be the cleaner home.
+- The tokenizer comes from the `taconite-sam3` crate (the host math and
+  `Timing` from `taconite`).
 
 ## License
 

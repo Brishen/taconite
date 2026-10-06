@@ -49,7 +49,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::marker::PhantomData;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -140,6 +140,7 @@ mod sys {
         pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
+        pub fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
     }
 
     pub const PROT_NONE: c_int = 0;
@@ -151,6 +152,7 @@ mod sys {
     pub const MAP_NORESERVE: c_int = 0x4000;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
     pub const ETIME: i32 = 62;
+    pub const SEEK_END: c_int = 2;
 
     /// `DRM_IOWR(nr, size)`: `_IOC(READ|WRITE, 'd', nr, size)`.
     pub const fn drm_iowr(nr: u32, size: usize) -> c_ulong {
@@ -170,6 +172,10 @@ mod sys {
     pub const GET_ARRAY: u32 = DRM_COMMAND_BASE + 10;
     // drm.h
     pub const GEM_CLOSE: u32 = 0x09;
+    pub const PRIME_HANDLE_TO_FD: u32 = 0x2d;
+    pub const PRIME_FD_TO_HANDLE: u32 = 0x2e;
+    /// `DRM_CLOEXEC | DRM_RDWR` (`O_CLOEXEC | O_RDWR`).
+    pub const PRIME_FLAGS: u32 = 0o2000000 | 0o2;
     pub const SYNCOBJ_TIMELINE_WAIT: u32 = 0xca;
 
     // enum amdxdna_bo_type
@@ -231,6 +237,15 @@ mod sys {
     pub struct HandlePad {
         pub handle: u32,
         pub pad: u32,
+    }
+
+    /// `drm_prime_handle`.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct PrimeHandle {
+        pub handle: u32,
+        pub flags: u32,
+        pub fd: i32,
     }
 
     #[repr(C)]
@@ -776,6 +791,35 @@ impl Session {
     pub fn alloc_of<T: Copy>(&self, n: usize) -> Result<Buffer, Error> {
         self.alloc(n * std::mem::size_of::<T>())
     }
+
+    /// A buffer over another device's memory, handed over as a dma-buf
+    /// (`PRIME_FD_TO_HANDLE`): a kernel argument like any other, mapped for
+    /// the host too. The buffer keeps the memory alive; `fd` stays the
+    /// caller's. Not for a dma-buf this session exported itself — the
+    /// driver hands back the exporting buffer's own handle, which both
+    /// would then close.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the handles are Send (see their impls), so the refcount they share must be atomic"
+    )]
+    pub fn import_dmabuf(&self, fd: BorrowedFd<'_>) -> Result<Buffer, Error> {
+        let dev = &self.inner;
+        // SAFETY: lseek on a live fd; a dma-buf reports its size at SEEK_END.
+        let bytes = unsafe { sys::lseek(fd.as_raw_fd(), 0, sys::SEEK_END) };
+        if bytes <= 0 {
+            return Err(Error::Buffer(format!("dma-buf size: {}", io::Error::last_os_error())));
+        }
+        let bytes = bytes as usize;
+        let berr = |what: &'static str| move |e: io::Error| Error::Buffer(format!("{what} ({bytes} bytes): {e}"));
+        let mut p = sys::PrimeHandle { fd: fd.as_raw_fd(), ..Default::default() };
+        sys::drm(dev.fd(), sys::PRIME_FD_TO_HANDLE, &mut p).map_err(berr("PRIME_FD_TO_HANDLE"))?;
+        let handle = p.handle;
+        let mut info = sys::GetBoInfo { handle, ..Default::default() };
+        sys::drm(dev.fd(), sys::GET_BO_INFO, &mut info).inspect_err(|_| dev.gem_close(handle)).map_err(berr("GET_BO_INFO"))?;
+        let ptr = dev.mmap(info.map_offset, bytes).inspect_err(|_| dev.gem_close(handle)).map_err(berr("mapping"))?;
+        let bo = Arc::new(Bo { dev: dev.clone(), handle, ptr, size: bytes, xdna_addr: info.xdna_addr });
+        Ok(Buffer { bo, offset: 0, bytes, _not_sync: PhantomData })
+    }
 }
 
 /// A command BO, mapped.
@@ -873,6 +917,22 @@ pub struct Kernel {
 }
 
 impl Kernel {
+    /// Rewrites 32-bit words of the instruction stream, as the XRT
+    /// kernel's `set_insts_words`: word `i` becomes `v` for each `(i, v)`.
+    /// No run of this kernel may be in flight.
+    pub fn set_insts_words(&self, words: &[(usize, u32)]) -> Result<(), Error> {
+        let host = self.instr.dev.heap_host(self.instr.xdna_addr);
+        for &(i, v) in words {
+            if (i + 1) * 4 > self.ninstr_bytes as usize {
+                return Err(Error::Kernel(format!("instruction word {i} is past the stream")));
+            }
+            // SAFETY: within the stream's ninstr_bytes bytes of the heap mapping at host.
+            unsafe { std::ptr::write_unaligned(host.add(i * 4) as *mut u32, v) };
+        }
+        flush(host, self.ninstr_bytes as usize);
+        Ok(())
+    }
+
     /// Launches the kernel over `args` (its buffer arguments in order, at
     /// most [`MAX_ARGS`]) and waits for it; returns the time from
     /// submission to completion. Inputs must have been
@@ -1131,6 +1191,21 @@ impl Buffer {
     pub fn sync_from_device(&self) -> Result<(), Error> {
         flush(self.host(), self.bytes);
         Ok(())
+    }
+
+    /// The whole allocation as a dma-buf (`PRIME_HANDLE_TO_FD`), for another
+    /// device to import — a GPU through Vulkan's
+    /// `VK_EXT_external_memory_dma_buf`. A sub-buffer is refused: export
+    /// the buffer it views.
+    pub fn export_dmabuf(&self) -> Result<OwnedFd, Error> {
+        if self.offset != 0 || self.bytes != self.bo.size {
+            return Err(Error::Buffer("a sub-buffer cannot be exported; export its parent".into()));
+        }
+        let mut p = sys::PrimeHandle { handle: self.bo.handle, flags: sys::PRIME_FLAGS, fd: -1 };
+        sys::drm(self.bo.dev.fd(), sys::PRIME_HANDLE_TO_FD, &mut p)
+            .map_err(|e| Error::Buffer(format!("PRIME_HANDLE_TO_FD: {e}")))?;
+        // SAFETY: a fresh fd the ioctl opened for us.
+        Ok(unsafe { OwnedFd::from_raw_fd(p.fd) })
     }
 
     /// Copies `data` in (which must fit) and syncs it to the device.

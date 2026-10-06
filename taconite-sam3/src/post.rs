@@ -19,6 +19,8 @@
 //! - [`instances`]: `sigmoid(logit) * sigmoid(presence) > threshold`, boxes
 //!   scaled to the image, masks = `sigmoid` upsampled bilinearly
 //!   (`align_corners=False`) to the image and thresholded.
+//! - [`upsample_threshold`]: that resize and threshold alone (point prompt
+//!   masks: their logits, `> 0`, as `post_process_masks`).
 
 use crate::Output;
 use crate::cpu::{par_rows, sigmoid};
@@ -137,19 +139,6 @@ pub struct Instance {
 pub fn instances(out: &Output, size: usize, w: usize, h: usize, threshold: f32, mask_threshold: f32) -> Vec<Instance> {
     let pres = sigmoid(out.presence);
     let px = size * size;
-    // source index / weight per destination coordinate (align_corners=False)
-    let axis = |n_out: usize| -> Vec<(usize, usize, f32)> {
-        let scale = size as f32 / n_out as f32;
-        (0..n_out)
-            .map(|d| {
-                let s = ((d as f32 + 0.5) * scale - 0.5).max(0.0);
-                let i0 = (s as usize).min(size - 1);
-                let i1 = if i0 < size - 1 { i0 + 1 } else { i0 };
-                (i0, i1, s - i0 as f32)
-            })
-            .collect()
-    };
-    let (ax, ay) = (axis(w), axis(h));
     let mut res = Vec::new();
     for (q, &logit) in out.logits.iter().enumerate() {
         let score = sigmoid(logit) * pres;
@@ -159,21 +148,43 @@ pub fn instances(out: &Output, size: usize, w: usize, h: usize, threshold: f32, 
         let b = &out.boxes[q * 4..q * 4 + 4];
         let bbox = [b[0] * w as f32, b[1] * h as f32, b[2] * w as f32, b[3] * h as f32];
         let prob: Vec<f32> = out.masks[q * px..(q + 1) * px].iter().map(|&v| sigmoid(v)).collect();
-        let mut mask = vec![false; w * h];
-        par_rows(&mut mask, w, |y0, piece| {
-            for (yi, row) in piece.chunks_mut(w).enumerate() {
-                let (y0s, y1s, ly) = ay[y0 + yi];
-                for (x, m) in row.iter_mut().enumerate() {
-                    let (x0s, x1s, lx) = ax[x];
-                    let top = prob[y0s * size + x0s] * (1.0 - lx) + prob[y0s * size + x1s] * lx;
-                    let bot = prob[y1s * size + x0s] * (1.0 - lx) + prob[y1s * size + x1s] * lx;
-                    *m = top * (1.0 - ly) + bot * ly > mask_threshold;
-                }
-            }
-        });
+        let mask = upsample_threshold(&prob, size, w, h, mask_threshold);
         res.push(Instance { score, bbox, mask });
     }
     res
+}
+
+/// Source indices and weight per destination coordinate of a bilinear
+/// `size -> n_out` resize (`align_corners=False`).
+fn bilinear_axis(size: usize, n_out: usize) -> Vec<(usize, usize, f32)> {
+    let scale = size as f32 / n_out as f32;
+    (0..n_out)
+        .map(|d| {
+            let s = ((d as f32 + 0.5) * scale - 0.5).max(0.0);
+            let i0 = (s as usize).min(size - 1);
+            let i1 = if i0 < size - 1 { i0 + 1 } else { i0 };
+            (i0, i1, s - i0 as f32)
+        })
+        .collect()
+}
+
+/// `m [size, size]` resized bilinearly (`align_corners=False`) to `w x h`
+/// and thresholded: `> threshold`, row-major `[h, w]`.
+pub fn upsample_threshold(m: &[f32], size: usize, w: usize, h: usize, threshold: f32) -> Vec<bool> {
+    let (ax, ay) = (bilinear_axis(size, w), bilinear_axis(size, h));
+    let mut mask = vec![false; w * h];
+    par_rows(&mut mask, w, |y0, piece| {
+        for (yi, row) in piece.chunks_mut(w).enumerate() {
+            let (y0s, y1s, ly) = ay[y0 + yi];
+            for (x, o) in row.iter_mut().enumerate() {
+                let (x0s, x1s, lx) = ax[x];
+                let top = m[y0s * size + x0s] * (1.0 - lx) + m[y0s * size + x1s] * lx;
+                let bot = m[y1s * size + x0s] * (1.0 - lx) + m[y1s * size + x1s] * lx;
+                *o = top * (1.0 - ly) + bot * ly > threshold;
+            }
+        }
+    });
+    mask
 }
 
 #[cfg(test)]

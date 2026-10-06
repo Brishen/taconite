@@ -3,7 +3,7 @@
 
 [package]
 name = "taconite"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Replays IRON (mlir-aie) kernels on an AMD XDNA NPU, through XRT or directly through the amdxdna driver"
@@ -24,10 +24,17 @@ default = ["xrt"]
 # headers and library. Without it the crate is pure Rust — `compile`, and
 # `direct` (the amdxdna ioctls) on Linux/x86-64 — and builds with no XRT.
 xrt = []
+# `gpu`: Vulkan compute on the iGPU over the NPU's buffers (dma-bufs),
+# for the host work between a model's kernels. Pulls in ash and naga;
+# libvulkan is loaded at run time.
+gpu = ["dep:ash", "dep:naga"]
 
-# Deliberately no dependencies: build.rs drives g++/ar itself (no `cc`
-# crate) so the crate builds offline, and the API is plain `std`.
+# No dependencies by default: build.rs drives g++/ar itself (no `cc`
+# crate) so the crate builds offline, and the API is plain `std`. Only the
+# optional `gpu` feature pulls in crates.
 [dependencies]
+ash = { version = "0.38", optional = true }
+naga = { version = "29", features = ["wgsl-in", "spv-out"], optional = true }
 
 [[example]]
 name = "eltwise_mul"

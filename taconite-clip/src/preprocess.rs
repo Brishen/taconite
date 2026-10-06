@@ -20,7 +20,7 @@
 //! 3. `(x - 255 mean) / (255 std)` in f32 (the processor fuses the 1/255
 //!    rescale into the normalisation), CHW.
 
-use taconite_sam3::cpu::par_rows;
+use taconite::cpu::par_rows;
 
 /// Torch's (and PIL's) antialiasing bicubic, a = -0.5.
 fn bicubic(x: f64) -> f64 {

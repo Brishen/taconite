@@ -116,3 +116,44 @@ fn too_many_arguments_is_an_error_not_a_submission() {
     let refs: Vec<_> = bufs.iter().collect();
     assert!(matches!(kernel.run(&refs), Err(taconite::Error::Run(_))));
 }
+
+/// dma-buf round trip without a GPU: one session exports its buffers,
+/// another (its own DRM file, so its own handles and mappings over the
+/// same pages) imports them and runs the kernel on them; the owner reads
+/// the result through its own mapping.
+#[test]
+#[ignore = "needs an NPU and a built kernel"]
+fn exported_buffers_import_into_another_session() {
+    use std::os::fd::AsFd;
+    let (xclbin, insts, n) = artifacts();
+    let owner = Session::open(0).unwrap();
+    let user = Session::open(0).unwrap();
+    let kernel = user.load_kernel(&xclbin, &insts, None, 0).unwrap();
+    let (mut a, mut b, c) =
+        (owner.alloc_of::<u16>(n).unwrap(), owner.alloc_of::<u16>(n).unwrap(), owner.alloc_of::<u16>(n).unwrap());
+    let xs: Vec<u16> = (0..n).map(|i| f32_to_bf16(((i % 199) as f32 - 99.0) / 32.0)).collect();
+    let ys: Vec<u16> = (0..n).map(|i| f32_to_bf16(((i % 73) as f32 - 36.0) / 8.0)).collect();
+    a.write(&xs).unwrap();
+    b.write(&ys).unwrap();
+    let import = |buf: &taconite::direct::Buffer| {
+        let fd = buf.export_dmabuf().unwrap();
+        let imported = user.import_dmabuf(fd.as_fd()).unwrap();
+        assert_eq!(imported.len_bytes(), buf.len_bytes());
+        imported
+    };
+    let (ia, ib, ic) = (import(&a), import(&b), import(&c));
+    // the importer's mapping sees what the owner wrote
+    ia.sync_from_device().unwrap();
+    assert_eq!(ia.as_slice::<u16>(), &xs[..]);
+    kernel.run(&[&ia, &ib, &ic]).unwrap();
+    c.sync_from_device().unwrap();
+    for (i, &got) in c.as_slice::<u16>().iter().enumerate() {
+        let want = bf16_to_f32(f32_to_bf16(bf16_to_f32(xs[i]) * bf16_to_f32(ys[i])));
+        let got = bf16_to_f32(got);
+        assert!((got - want).abs() <= 0.04 * want.abs() + 1e-6, "[{i}] {got} != {want}");
+    }
+    // the imports keep the memory alive past the exporter's buffers
+    drop((a, b, c));
+    kernel.run(&[&ia, &ib, &ic]).unwrap();
+    assert!(ic.sub(0, 64).unwrap().export_dmabuf().is_err(), "a sub-buffer is not exportable");
+}

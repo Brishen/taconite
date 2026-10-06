@@ -13,7 +13,14 @@
 
 use taconite::bf16_to_f32;
 
+use std::collections::HashMap;
+
+use crate::Config;
+use crate::bundle::{GemmSpec, Store};
 use crate::cpu::{self, Attn, Rows, W, ln_row, par_rows, sigmoid};
+#[cfg(feature = "gpu")]
+use crate::gemm_dev;
+use crate::npu::Buffer;
 use crate::npu::{pull, push};
 use crate::pack::pack_b;
 use crate::text::Text;
@@ -47,9 +54,7 @@ fn xyxy(b: &[f32]) -> [f32; 4] {
 
 impl Sam3 {
     pub(crate) fn lin(&self, x: &[f32], n_in: usize, name: &str) -> Result<Vec<f32>, Error> {
-        let st = &self.store;
-        let b = if st.has(&format!("{name}.b")) { Some(st.f32(&format!("{name}.b"))?) } else { None };
-        Ok(cpu::linear(x, n_in, W::F32(st.f32(&format!("{name}.w"))?), b))
+        lin(&self.store, x, n_in, name)
     }
 
     fn ln(&self, x: &[f32], dim: usize, name: &str) -> Result<Vec<f32>, Error> {
@@ -71,56 +76,11 @@ impl Sam3 {
     }
 
     /// The cross-attention `prefix` (`d.<i>.ca` or `m.ca`) folded over this
-    /// prompt and packed into slots `<slot>.s` / `<slot>.c`: the scores
-    /// `h Bs + bs` (`N` = heads x prompt tokens) and the output `p Bc + b_o`.
+    /// prompt and packed into slots `<slot>.s` / `<slot>.c` (see
+    /// [`fold_cross_into`]).
     pub(crate) fn fold_cross(&mut self, prefix: &str, slot: &str, text: &Text) -> Result<(), Error> {
-        let c = &self.cfg;
-        let (d, nh, l) = (c.d_model, c.d_heads, c.text_len);
-        let hd = d / nh;
-        let st = &self.store;
-        let k = self.lin(&text.feats, d, &format!("{prefix}.k"))?; // [L, D]
-        let v = self.lin(&text.feats, d, &format!("{prefix}.v"))?;
-        let wq = st.f32(&format!("{prefix}.q.w"))?; // [D, D] out x in
-        let bq = st.f32(&format!("{prefix}.q.b"))?;
-        let wo = st.f32(&format!("{prefix}.o.w"))?;
-        let bo = st.f32(&format!("{prefix}.o.b"))?;
-        let inv = 1.0 / (hd as f32).sqrt();
-        let mut bs_m = vec![0f32; d * nh * l];
-        let mut bs_b = vec![0f32; nh * l];
-        let mut bc_m = vec![0f32; nh * l * d];
-        par_rows(&mut bs_m, nh * l, |i0, piece| {
-            for (ii, row) in piece.chunks_mut(nh * l).enumerate() {
-                let i = i0 + ii; // input feature
-                for h in 0..nh {
-                    for j in 0..l {
-                        let mut s = 0.0;
-                        for e in 0..hd {
-                            s += wq[(h * hd + e) * d + i] * k[j * d + h * hd + e];
-                        }
-                        row[h * l + j] = s * inv;
-                    }
-                }
-            }
-        });
-        for h in 0..nh {
-            for j in 0..l {
-                bs_b[h * l + j] = (0..hd).map(|e| bq[h * hd + e] * k[j * d + h * hd + e]).sum::<f32>() * inv;
-            }
-        }
-        par_rows(&mut bc_m, d, |r0, piece| {
-            for (ri, row) in piece.chunks_mut(d).enumerate() {
-                let r = r0 + ri;
-                let (h, j) = (r / l, r % l);
-                for (o, out) in row.iter_mut().enumerate() {
-                    *out = (0..hd).map(|e| v[j * d + h * hd + e] * wo[o * d + h * hd + e]).sum();
-                }
-            }
-        });
-        let ps = pack_b(self.npu.spec("d_s")?, &bs_m, Some(&bs_b));
-        let pc = pack_b(self.npu.spec("d_c")?, &bc_m, Some(bo));
-        self.slots.get_mut(&format!("{slot}.s")).unwrap().write(&ps)?;
-        self.slots.get_mut(&format!("{slot}.c")).unwrap().write(&pc)?;
-        Ok(())
+        let specs = (self.npu.spec("d_s")?.clone(), self.npu.spec("d_c")?.clone());
+        fold_cross_into(&self.store, &self.cfg, (&specs.0, &specs.1), &mut self.slots, prefix, slot, text)
     }
 
     /// The folded prompt cross-attention on `x [T, D]` (already normalised
@@ -161,6 +121,12 @@ impl Sam3 {
     /// The DETR encoder: `fpn2 [T, 256]` (the 72 x 72 level, raster) and
     /// the prompt -> `[T, 256]`.
     pub fn detr_encoder(&mut self, fpn2: &[f32], text: &Text) -> Result<Vec<f32>, Error> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            self.gpu().glue.fpn[2].write(fpn2);
+            self.detr_encoder_gpu(text, false)?;
+            return Ok(self.gpu().glue.x.read(self.cfg.tokens() * self.cfg.d_model));
+        }
         let c = self.cfg.clone();
         let (d, nh, t) = (c.d_model, c.d_heads, c.tokens());
         let pd = self.npu.mhas["mha_d"].d * nh;
@@ -284,6 +250,11 @@ impl Sam3 {
     pub fn detr_decoder(&mut self, enc: &[f32], text: &Text) -> Result<Decoded, Error> {
         let c = self.cfg.clone();
         let (d, nh, t) = (c.d_model, c.d_heads, c.tokens());
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() && self.gpu_dec {
+            self.gpu().glue.x.write(enc);
+            return self.detr_decoder_gpu(text);
+        }
         let kvw = self.npu.spec("dec_kv")?.n;
         // every layer's vision keys (from enc + pos) and values (from enc)
         {
@@ -443,4 +414,130 @@ impl Sam3 {
         let scale = 1.0 / (d as f32).sqrt();
         Ok(pq.chunks(d).map(|q| (cpu::dot(q, &pt) * scale).clamp(-12.0, 12.0)).collect())
     }
+
+    /// The DETR encoder in NPU+GPU mode, from `glue.fpn[2]` to `glue.x`.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn detr_encoder_gpu(&mut self, text: &Text, folded: bool) -> Result<(), Error> {
+        let valid: Vec<u32> = text.valid.iter().map(|&v| v as u32).collect();
+        {
+            let gpu = self.gpu.as_ref().expect("NPU+GPU mode");
+            gpu.glue.valid.write(&valid);
+            gpu.run(&gpu.glue.enc_init, "enc_init", &mut self.timing)?;
+        }
+        for i in 0..self.cfg.d_layers {
+            let p = |n: &str| format!("d.{i}.{n}");
+            if !folded {
+                self.fold_cross(&p("ca"), &format!("d.{i}"), text)?;
+            }
+            let gpu = self.gpu.as_ref().expect("NPU+GPU mode");
+            let gl = &gpu.glue;
+            let (npu, io, w, slots, t) = (&mut self.npu, &self.io, &self.w, &self.slots, &mut self.timing);
+            gpu.run(&gl.enc_ln1[i], "enc_ln", t)?;
+            gemm_dev(npu, &io.d_qkv, &w[&p("qkv")], t)?;
+            gpu.run(&gl.split, "enc_split", t)?;
+            mha(npu, &io.mha_d, t)?;
+            gpu.run(&gl.copy_o, "enc_copy", t)?;
+            gemm_dev(npu, &io.d_o, &w[&p("o")], t)?;
+            gpu.run(&gl.enc_o[i], "enc_ln", t)?;
+            gemm_dev(npu, &io.d_s, &slots[&format!("d.{i}.s")], t)?;
+            gpu.run(&gl.softmax, "prompt_softmax", t)?;
+            gemm_dev(npu, &io.d_c, &slots[&format!("d.{i}.c")], t)?;
+            gpu.run(&gl.enc_c[i], "enc_ln", t)?;
+            gemm_dev(npu, &io.d_fc1, &w[&p("fc1")], t)?;
+            gemm_dev(npu, &io.d_fc2, &w[&p("fc2")], t)?;
+            gpu.run(&gl.enc_fc[i], "enc_add", t)?;
+        }
+        Ok(())
+    }
+
+    /// The DETR decoder in NPU+GPU mode, from `glue.x`: the keys and values
+    /// GEMM's A built on the GPU, the query layers there too.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn detr_decoder_gpu(&mut self, text: &Text) -> Result<Decoded, Error> {
+        let gpu = self.gpu.as_ref().expect("NPU+GPU mode");
+        // the first layer's prompt-only part runs while the NPU makes the keys
+        gpu.dec.start(&gpu.vk, text)?;
+        gpu.run(&gpu.glue.dec_kv_in, "dec_kv_in", &mut self.timing)?;
+        gemm_dev(&mut self.npu, &self.io.dec_kv, &self.w["dec.kv"], &mut self.timing)?;
+        let run = gpu.dec.finish(&gpu.vk)?;
+        self.timing.add("gpu:decoder", run.gpu_time);
+        let last = run.layer_boxes.last().expect("the decoder has layers");
+        let boxes = last.chunks(4).flat_map(xyxy).collect();
+        let logits = self.score(&run.normed, text)?;
+        Ok(Decoded {
+            hidden: run.normed,
+            boxes,
+            logits,
+            presence: *run.layer_presence.last().expect("the decoder has layers"),
+            layer_boxes: run.layer_boxes,
+            layer_presence: run.layer_presence,
+        })
+    }
+}
+
+/// `y = x W^T + b` with the bundle's weights `name.w` / `name.b`.
+pub(crate) fn lin(store: &Store, x: &[f32], n_in: usize, name: &str) -> Result<Vec<f32>, Error> {
+    let b = if store.has(&format!("{name}.b")) { Some(store.f32(&format!("{name}.b"))?) } else { None };
+    Ok(cpu::linear(x, n_in, W::F32(store.f32(&format!("{name}.w"))?), b))
+}
+
+/// The cross-attention `prefix` (`d.<i>.ca` or `m.ca`) folded over this
+/// prompt and packed into slots `<slot>.s` / `<slot>.c`: the scores
+/// `h Bs + bs` (`N` = heads x prompt tokens) and the output `p Bc + b_o`.
+/// A free function so it can run beside the NPU (it needs only the prompt).
+pub(crate) fn fold_cross_into(
+    store: &Store,
+    c: &Config,
+    (spec_s, spec_c): (&GemmSpec, &GemmSpec),
+    slots: &mut HashMap<String, Buffer>,
+    prefix: &str,
+    slot: &str,
+    text: &Text,
+) -> Result<(), Error> {
+    let (d, nh, l) = (c.d_model, c.d_heads, c.text_len);
+    let hd = d / nh;
+    let st = store;
+    let k = lin(store, &text.feats, d, &format!("{prefix}.k"))?; // [L, D]
+    let v = lin(store, &text.feats, d, &format!("{prefix}.v"))?;
+    let wq = st.f32(&format!("{prefix}.q.w"))?; // [D, D] out x in
+    let bq = st.f32(&format!("{prefix}.q.b"))?;
+    let wo = st.f32(&format!("{prefix}.o.w"))?;
+    let bo = st.f32(&format!("{prefix}.o.b"))?;
+    let inv = 1.0 / (hd as f32).sqrt();
+    let mut bs_m = vec![0f32; d * nh * l];
+    let mut bs_b = vec![0f32; nh * l];
+    let mut bc_m = vec![0f32; nh * l * d];
+    par_rows(&mut bs_m, nh * l, |i0, piece| {
+        for (ii, row) in piece.chunks_mut(nh * l).enumerate() {
+            let i = i0 + ii; // input feature
+            for h in 0..nh {
+                for j in 0..l {
+                    let mut s = 0.0;
+                    for e in 0..hd {
+                        s += wq[(h * hd + e) * d + i] * k[j * d + h * hd + e];
+                    }
+                    row[h * l + j] = s * inv;
+                }
+            }
+        }
+    });
+    for h in 0..nh {
+        for j in 0..l {
+            bs_b[h * l + j] = (0..hd).map(|e| bq[h * hd + e] * k[j * d + h * hd + e]).sum::<f32>() * inv;
+        }
+    }
+    par_rows(&mut bc_m, d, |r0, piece| {
+        for (ri, row) in piece.chunks_mut(d).enumerate() {
+            let r = r0 + ri;
+            let (h, j) = (r / l, r % l);
+            for (o, out) in row.iter_mut().enumerate() {
+                *out = (0..hd).map(|e| v[j * d + h * hd + e] * wo[o * d + h * hd + e]).sum();
+            }
+        }
+    });
+    let ps = pack_b(spec_s, &bs_m, Some(&bs_b));
+    let pc = pack_b(spec_c, &bc_m, Some(bo));
+    slots.get_mut(&format!("{slot}.s")).unwrap().write(&ps)?;
+    slots.get_mut(&format!("{slot}.c")).unwrap().write(&pc)?;
+    Ok(())
 }

@@ -13,10 +13,12 @@
 
 use taconite::{bf16_to_f32, f32_to_bf16};
 
+use crate::bundle::{GemmSpec, Store};
 use crate::cpu::{self, par_rows};
+use crate::detr::lin;
 use crate::pack::pack_b;
 use crate::text::Text;
-use crate::{Error, Sam3, gemm};
+use crate::{Error, Sam3, gemm, gemm_dev};
 
 impl Sam3 {
     /// `(pred_masks [Q, S, S], semantic [S, S])` from the decoder's last
@@ -29,9 +31,16 @@ impl Sam3 {
         enc: &[f32],
         text: &Text,
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            let glue = &self.gpu().glue;
+            glue.fpn[0].write(&fpn[0]);
+            glue.fpn[1].write(&fpn[1]);
+            glue.x.write(enc);
+            return self.mask_decoder_gpu(hidden, text, false);
+        }
         let c = self.cfg.clone();
         let (d, g) = (c.d_model, c.grid);
-        let q = hidden.len() / d;
 
         // prompt cross-attention on the encoder output
         let t0 = std::time::Instant::now();
@@ -71,43 +80,92 @@ impl Sam3 {
             p = y;
             side = s2;
         }
+        self.mask_head(hidden, side, Some(&p), None)
+    }
+
+    /// The mask decoder in NPU+GPU mode, from `glue.x` and `glue.fpn`: the
+    /// pixel decoder's maps stay on the GPU, which writes the mask head's A.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn mask_decoder_gpu(
+        &mut self,
+        hidden: &[f32],
+        text: &Text,
+        folded: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        let g = self.cfg.grid;
+        let d = self.cfg.d_model;
+        let t0 = std::time::Instant::now();
+        if !folded {
+            self.fold_cross("m.ca", "m", text)?;
+        }
+        let valid: Vec<u32> = text.valid.iter().map(|&v| v as u32).collect();
+        let head_spec = self.npu.spec("m_head")?.clone();
+        let Sam3 { store, npu, io, w, slots, timing: t, gpu, .. } = self;
+        let gpu = gpu.as_ref().expect("NPU+GPU mode");
+        let gl = &gpu.glue;
+        gl.valid.write(&valid);
+        let store = &*store;
+        // the head's weights (an MLP over the queries, folded and packed)
+        // need only `hidden`: built on a side thread beside the pixel decoder
+        let packed = std::thread::scope(|sc| -> Result<Vec<u8>, Error> {
+            let head = sc.spawn(|| {
+                let t0 = std::time::Instant::now();
+                mask_head_packed(store, d, &head_spec, hidden).map(|p| (p, t0.elapsed()))
+            });
+            gpu.run(&gl.mask_ln, "mask_ln", t)?;
+            gemm_dev(npu, &io.d_s, &slots["m.s"], t)?;
+            gpu.run(&gl.softmax, "prompt_softmax", t)?;
+            gemm_dev(npu, &io.d_c, &slots["m.c"], t)?;
+            gpu.run(&gl.mask_add, "mask_add", t)?;
+            t.add("mask_cross", t0.elapsed());
+            for i in 0..2 {
+                let s2 = g << (i + 1);
+                gpu.run(&gl.mask_up[i], "mask_up", t)?;
+                gemm_dev(npu, &io.conv[&s2], &w[&format!("m.conv{i}")], t)?;
+                gpu.run(&gl.mask_gn[i], "mask_gn", t)?;
+            }
+            let (packed, dt) = head.join().expect("the mask head thread")?;
+            t.add("mask_head_weights (overlapped)", dt);
+            Ok(packed)
+        })?;
+        self.mask_head(hidden, 4 * g, None, Some(packed))
+    }
+
+    /// The folded mask + semantic head over the `side x side` pixel
+    /// embedding: `p` (f32, narrowed here into the GEMM's A), or `None` when
+    /// the GPU has written that A.
+    fn mask_head(
+        &mut self,
+        hidden: &[f32],
+        side: usize,
+        p: Option<&[f32]>,
+        packed: Option<Vec<u8>>,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        let d = self.cfg.d_model;
+        let q = hidden.len() / d;
         let t0 = std::time::Instant::now();
 
         // folded mask + semantic head
-        let mut m = self.lin(hidden, d, "m.embed.0")?;
-        cpu::relu_(&mut m);
-        let mut m = self.lin(&m, d, "m.embed.1")?;
-        cpu::relu_(&mut m);
-        let m = self.lin(&m, d, "m.embed.2")?; // [Q, D]
-        let st = &self.store;
-        let (wi, bi) = (st.f32("m.inst.w")?, st.f32("m.inst.b")?); // [D out, D in]
-        let (ws, bs) = (st.f32("m.sem.w")?, st.f32("m.sem.b")?);
-        let spec = self.npu.spec("m_head")?.clone();
-        let n = spec.n;
-        if q + 1 > n {
-            return Err(Error::Input(format!("{q} queries + semantic > {n}")));
-        }
-        let mut bm = vec![0f32; d * n];
-        let mut bb = vec![0f32; n];
-        for qi in 0..q {
-            let mq = &m[qi * d..(qi + 1) * d];
-            for i in 0..d {
-                bm[i * n + qi] = (0..d).map(|o| wi[o * d + i] * mq[o]).sum();
-            }
-            bb[qi] = cpu::dot(mq, bi);
-        }
-        for i in 0..d {
-            bm[i * n + q] = ws[i];
-        }
-        bb[q] = bs[0];
-        let packed = pack_b(&spec, &bm, Some(&bb));
+        let packed = match packed {
+            Some(p) => p,
+            None => mask_head_packed(&self.store, d, self.npu.spec("m_head")?, hidden)?,
+        };
         self.slots.get_mut("m.head").unwrap().write(&packed)?;
+        let n = self.npu.spec("m_head")?.n;
         let px = side * side;
-        let mut pb = vec![0u16; p.len()];
-        crate::narrow(&p, &mut pb);
-        self.io.m_head.set_a(&pb)?;
-        self.timing.add("mask_head_prep", t0.elapsed());
-        gemm(&mut self.npu, &self.io.m_head, &self.slots["m.head"], &mut self.timing)?;
+        match p {
+            Some(p) => {
+                let mut pb = vec![0u16; p.len()];
+                crate::narrow(p, &mut pb);
+                self.io.m_head.set_a(&pb)?;
+                self.timing.add("mask_head_prep", t0.elapsed());
+                gemm(&mut self.npu, &self.io.m_head, &self.slots["m.head"], &mut self.timing)?;
+            }
+            None => {
+                self.timing.add("mask_head_prep", t0.elapsed());
+                gemm_dev(&mut self.npu, &self.io.m_head, &self.slots["m.head"], &mut self.timing)?;
+            }
+        }
         let t0 = std::time::Instant::now();
         let out = self.io.m_head.get_c(px)?;
         // [px, n] -> [q, px], in blocks of pixels: contiguous reads, and
@@ -196,4 +254,37 @@ fn group_norm_relu(x: &mut [f32], c: usize, groups: usize, w: &[f32], b: &[f32])
             }
         }
     });
+}
+
+/// The folded mask + semantic head's B for the `m_head` GEMM: the query
+/// mask embeddings `m = MLP(hidden)` folded through the instance head,
+/// `B[i, q] = (W_inst^T m_q)[i]` with bias `m_q . b_inst`, the semantic
+/// head in column `Q`; packed.
+pub(crate) fn mask_head_packed(store: &Store, d: usize, spec: &GemmSpec, hidden: &[f32]) -> Result<Vec<u8>, Error> {
+    let q = hidden.len() / d;
+    let mut m = lin(store, hidden, d, "m.embed.0")?;
+    cpu::relu_(&mut m);
+    let mut m = lin(store, &m, d, "m.embed.1")?;
+    cpu::relu_(&mut m);
+    let m = lin(store, &m, d, "m.embed.2")?; // [Q, D]
+    let (wi, bi) = (store.f32("m.inst.w")?, store.f32("m.inst.b")?); // [D out, D in]
+    let (ws, bs) = (store.f32("m.sem.w")?, store.f32("m.sem.b")?);
+    let n = spec.n;
+    if q + 1 > n {
+        return Err(Error::Input(format!("{q} queries + semantic > {n}")));
+    }
+    let mut bm = vec![0f32; d * n];
+    let mut bb = vec![0f32; n];
+    for qi in 0..q {
+        let mq = &m[qi * d..(qi + 1) * d];
+        for i in 0..d {
+            bm[i * n + qi] = (0..d).map(|o| wi[o * d + i] * mq[o]).sum();
+        }
+        bb[qi] = cpu::dot(mq, bi);
+    }
+    for i in 0..d {
+        bm[i * n + q] = ws[i];
+    }
+    bb[q] = bs[0];
+    Ok(pack_b(spec, &bm, Some(&bb)))
 }
