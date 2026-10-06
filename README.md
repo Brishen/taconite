@@ -25,6 +25,7 @@ from Rust.
 | [`taconite-adaface`](taconite-adaface) | AdaFace IR-18 / IR-101 face embeddings, an embeddable library |
 | [`taconite-qwen35`](taconite-qwen35) | Qwen3.5-2B chat: a hybrid Gated DeltaNet / attention LLM, prefill GEMMs and decode GEMVs on the NPU (`qwen35` binary) |
 | [`taconite-embeddinggemma2`](taconite-embeddinggemma2) | EmbeddingGemma 2 image embeddings in its shared text / image space (`embeddinggemma2` binary) |
+| [`taconite-sapiens2`](taconite-sapiens2) | Sapiens2-Pose 0.4B: 308 whole-body keypoints (body, feet, hands, face) for a person box (`sapiens2` binary) |
 
 Each crate is its own package (there is no workspace); each one's README
 covers its build, usage, accuracy and speed.
@@ -58,6 +59,7 @@ Prebuilt NPU2 bundles are on Hugging Face:
 - GAIC: [`brishen/iron-gaic-vgg16-npu2`](https://huggingface.co/brishen/iron-gaic-vgg16-npu2)
 - Qwen3.5-2B: [`brishen/iron-qwen3.5-2b-npu2`](https://huggingface.co/brishen/iron-qwen3.5-2b-npu2)
 - EmbeddingGemma 2: [`brishen/iron-embeddinggemma2-npu2`](https://huggingface.co/brishen/iron-embeddinggemma2-npu2)
+- Sapiens2-Pose 0.4B: [`brishen/iron-sapiens2-pose-0.4b-npu2`](https://huggingface.co/brishen/iron-sapiens2-pose-0.4b-npu2)
 
 ## Requirements
 
