@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
-//! EmbeddingGemma 2 (`google/embeddinggemma-2`) image embeddings on an AMD
-//! XDNA NPU.
+//! EmbeddingGemma 2 (`google/embeddinggemma-2`) image and text embeddings
+//! on an AMD XDNA NPU.
 //!
 //! The bundle `iron/applications/embeddinggemma2/export_eg2.py` writes
 //! holds every compiled IRON kernel and the weights (the NPU ones
@@ -14,9 +14,14 @@
 //! | vision tower (16 layers, 768 wide) | every projection (`flm.GEMM`s: patch embedding, qkv, o, GeGLU gate+up, down, embed_vision) and the attention (the MHA operator) | resize + patchify (`preprocess.rs`), position embeddings, RMSNorms, q / k / v norms, 2D RoPE, residual adds, 3 x 3 pooling |
 //! | text encoder (24 layers, 512 wide) | every projection (per-layer-input projection, qkv, o, GeGLU, down, PLE gate + projection) | norms, RoPE, attention (~270 tokens), per-layer gating, mean pooling, the 512 -> 768 projection |
 //!
-//! [`EmbeddingGemma2::embed_rgb`] gives the L2-normalized 768-d
-//! embedding sentence-transformers computes for an image; it lives in the
-//! same space as the model's text embeddings (cosine similarity).
+//! [`EmbeddingGemma2::embed_rgb`] and [`EmbeddingGemma2::embed_text`]
+//! give the L2-normalized 768-d embeddings sentence-transformers computes
+//! for an image and for a text (with its task prompt, e.g. `SearchQuery`
+//! or `Document`); both live in the model's one space, compared by cosine.
+//! Text runs through the same text encoder as an image's soft tokens:
+//! Gemma's tokenizer (`tokenizer.rs`), the token embeddings, then every
+//! projection on the NPU and the attention (a 512-token sliding window on
+//! 20 of the 24 layers) on the host.
 
 use std::fmt;
 use std::path::Path;
@@ -28,9 +33,11 @@ pub use taconite::Timing;
 pub mod model;
 pub mod npu;
 pub mod preprocess;
+pub mod tokenizer;
 
 use model::Model;
 use npu::Npu;
+use tokenizer::Tokenizer;
 
 pub const VERSION: u32 = 1;
 
@@ -97,6 +104,9 @@ pub struct Config {
     pub o_width: usize,
     pub max_soft_tokens: usize,
     pub no_window: u32,
+    /// the longest text (tokens, with `<bos>` / `<eos>`) the bundle takes;
+    /// 0 for an image-only bundle
+    pub max_text_tokens: usize,
 }
 
 impl Config {
@@ -140,6 +150,7 @@ impl Config {
             o_width: p("o_width")?,
             max_soft_tokens: p("max_soft_tokens")?,
             no_window: m.param_as("no_window")?,
+            max_text_tokens: if m.has_param("max_text_tokens") { p("max_text_tokens")? } else { 0 },
         })
     }
 
@@ -155,6 +166,8 @@ pub struct EmbeddingGemma2 {
     pub model: Model,
     pub manifest: Manifest,
     pub store: Store,
+    /// None for an image-only bundle
+    pub tokenizer: Option<Tokenizer>,
     /// where the last call spent its time (`npu:<kernel>`, host stages)
     pub timing: Timing,
 }
@@ -168,7 +181,8 @@ impl EmbeddingGemma2 {
         let cfg = Config::load(&manifest)?;
         let npu = Npu::open(&manifest)?;
         let model = Model::load(&cfg, &store, &npu)?;
-        Ok(EmbeddingGemma2 { cfg, npu, model, manifest, store, timing: Timing::default() })
+        let tokenizer = Tokenizer::load(&manifest, &store)?;
+        Ok(EmbeddingGemma2 { cfg, npu, model, manifest, store, tokenizer, timing: Timing::default() })
     }
 
     /// Hardware contexts the bundle's kernels use.
@@ -194,7 +208,61 @@ impl EmbeddingGemma2 {
     pub fn embed_patches(&mut self, p: &preprocess::Patches) -> Result<Vec<f32>, Error> {
         self.timing.clear();
         let soft = self.model.vision(&self.cfg, &self.npu, p, &mut self.timing)?;
-        self.model.text(&self.cfg, &self.npu, &soft, &mut self.timing)
+        let x = self.model.image_sequence(&self.cfg, &soft);
+        self.model.text(&self.cfg, &self.npu, x, &mut self.timing)
+    }
+
+    /// The prompt names the model was trained with ("SearchQuery",
+    /// "Document", "Classification", ...) and their text.
+    pub fn prompts(&self) -> &[(String, String)] {
+        self.tokenizer.as_ref().map_or(&[], |t| t.prompts.as_slice())
+    }
+
+    /// `text`'s token ids, with prompt `prompt` (a name from
+    /// [`prompts`](Self::prompts)) prepended, as sentence-transformers
+    /// makes them.
+    pub fn tokenize(&self, text: &str, prompt: Option<&str>) -> Result<Vec<u32>, Error> {
+        let tok = self.tokenizer.as_ref().ok_or_else(|| Error::Bundle("this bundle has no text path".into()))?;
+        let full = match prompt {
+            Some(p) => {
+                let pre = tok.prompt(p).ok_or_else(|| {
+                    let names: Vec<&str> = tok.prompts.iter().map(|(n, _)| n.as_str()).collect();
+                    Error::Input(format!("no prompt {p} (the model's: {})", names.join(", ")))
+                })?;
+                format!("{pre}{text}")
+            }
+            None => text.to_string(),
+        };
+        Ok(tok.encode(&full))
+    }
+
+    /// A text -> its unit 768-d embedding. `prompt` names the task prefix:
+    /// "SearchQuery" for a query, "Document" for what it searches (see the
+    /// model card); None embeds the text as it is.
+    pub fn embed_text(&mut self, text: &str, prompt: Option<&str>) -> Result<Vec<f32>, Error> {
+        let ids = self.tokenize(text, prompt)?;
+        self.embed_ids(&ids)
+    }
+
+    /// Token ids -> their unit embedding.
+    pub fn embed_ids(&mut self, ids: &[u32]) -> Result<Vec<f32>, Error> {
+        let (d, max) = (self.cfg.d, self.cfg.max_text_tokens);
+        if ids.len() > max {
+            return Err(Error::Input(format!("{} tokens: this bundle takes at most {max}", ids.len())));
+        }
+        self.timing.clear();
+        let table = self.store.bf16("t.embed")?;
+        let vocab = table.len() / d;
+        let scale = (d as f32).sqrt();
+        let mut x = Vec::with_capacity(ids.len() * d);
+        for &id in ids {
+            let id = id as usize;
+            if id >= vocab {
+                return Err(Error::Input(format!("token id {id} (vocabulary {vocab})")));
+            }
+            x.extend(table[id * d..(id + 1) * d].iter().map(|&b| taconite::bf16_to_f32(b) * scale));
+        }
+        self.model.text(&self.cfg, &self.npu, x, &mut self.timing)
     }
 
     /// An image's patches -> its soft tokens `[s, 512]` (the text model's

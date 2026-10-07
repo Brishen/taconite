@@ -1,16 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
-//! `embeddinggemma2`: EmbeddingGemma 2 image embeddings on the NPU.
+//! `embeddinggemma2`: EmbeddingGemma 2 image and text embeddings on the NPU.
 //!
 //! ```text
-//! embeddinggemma2 embed <bundle> <image>... [--dim 768|512|256|128] [-o out.f32] [--reps N]
+//! embeddinggemma2 embed <bundle> [<image>...] [--text <text>]... [--prompt <name>]
+//!                       [--dim 768|512|256|128] [-o out.f32] [--reps N]
+//! embeddinggemma2 prompts <bundle>
 //! embeddinggemma2 check <bundle>
 //! ```
 //!
-//! `embed` prints each image's time and leading values; `-o` writes the
-//! embeddings as raw little-endian f32, a row an image. `check` runs the
-//! bundle's reference images against the float32 HF model's results.
+//! `embed` prints each input's time and leading values and, for several,
+//! their cosine similarities; `-o` writes the embeddings as raw
+//! little-endian f32, a row an input (images first, then texts). `--prompt`
+//! prefixes every text with one of the model's task prompts (`prompts`
+//! lists them: SearchQuery for queries, Document for what they search,
+//! ...). `check` runs the bundle's reference images and texts against the
+//! float32 sentence-transformers results.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,6 +49,7 @@ fn timing_line(m: &EmbeddingGemma2) -> String {
 fn embed(args: &[String]) -> R<()> {
     let dir = Path::new(args.first().ok_or("give a bundle")?);
     let (mut images, mut out, mut dim, mut reps) = (Vec::new(), None, 768, 1);
+    let (mut texts, mut prompt): (Vec<String>, Option<String>) = (Vec::new(), None);
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -62,12 +69,20 @@ fn embed(args: &[String]) -> R<()> {
                 taconite::cpu::set_threads(args[i + 1].parse()?);
                 i += 1;
             }
+            "--text" => {
+                texts.push(args.get(i + 1).ok_or("--text needs a text")?.clone());
+                i += 1;
+            }
+            "--prompt" => {
+                prompt = Some(args.get(i + 1).ok_or("--prompt needs a name")?.clone());
+                i += 1;
+            }
             a => images.push(PathBuf::from(a)),
         }
         i += 1;
     }
-    if images.is_empty() {
-        return Err("give at least one image".into());
+    if images.is_empty() && texts.is_empty() {
+        return Err("give at least one image or --text".into());
     }
     if ![768, 512, 256, 128].contains(&dim) {
         return Err(format!("--dim {dim}: the model is trained for 768, 512, 256 or 128").into());
@@ -76,6 +91,7 @@ fn embed(args: &[String]) -> R<()> {
     let mut m = EmbeddingGemma2::load(dir)?;
     eprintln!("loaded {} ({} hardware contexts) in {:.1} s", dir.display(), m.contexts(), t0.elapsed().as_secs_f64());
     let mut rows = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
     for p in &images {
         let (rgb, w, h) = load_rgb(p)?;
         let mut e = Vec::new();
@@ -87,12 +103,30 @@ fn embed(args: &[String]) -> R<()> {
         let e = truncate(&e, dim);
         println!("{}: [{}, ...]", p.display(), e[..6].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(", "));
         rows.push(e);
+        labels.push(p.display().to_string());
+    }
+    for text in &texts {
+        let mut e = Vec::new();
+        for _ in 0..reps {
+            let t1 = Instant::now();
+            e = m.embed_text(text, prompt.as_deref())?;
+            eprintln!(
+                "{text:?}: {} tokens, {:.0} ms; {}",
+                m.tokenize(text, prompt.as_deref())?.len(),
+                t1.elapsed().as_secs_f64() * 1e3,
+                timing_line(&m)
+            );
+        }
+        let e = truncate(&e, dim);
+        println!("{text:?}: [{}, ...]", e[..6].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(", "));
+        rows.push(e);
+        labels.push(format!("{text:?}"));
     }
     if rows.len() > 1 {
         println!("cosine similarity:");
         for (a, ra) in rows.iter().enumerate() {
             let line: Vec<String> = rows.iter().map(|rb| format!("{:.3}", cosine(ra, rb))).collect();
-            println!("  {}: {}", images[a].display(), line.join(" "));
+            println!("  {}: {}", labels[a], line.join(" "));
         }
     }
     if let Some(out) = out {
@@ -187,8 +221,53 @@ fn check(args: &[String]) -> R<bool> {
         }
         println!("  max |d| {max_d:.4}");
     }
+    let trefs: Vec<(usize, String, String)> = m
+        .manifest
+        .tagged("tref")
+        .map(|r| Ok((r.field_as(0)?, r.field(1)?.to_string(), hex_text(r.field(2)?))))
+        .collect::<Result<_, taconite_bundle::Error>>()?;
+    if !trefs.is_empty() {
+        println!("texts (tokens, ids vs HF, embedding cos vs float32 / vs the Python NPU app):");
+        let (mut worst, mut ids_ok) = (1f32, 0);
+        for (j, prompt, text) in &trefs {
+            let prompt = (prompt != "-").then_some(prompt.as_str());
+            let ids = m.tokenize(text, prompt)?;
+            let rids: Vec<u32> = m.store.i32(&format!("tref.{j}.ids"))?.iter().map(|&v| v as u32).collect();
+            let t1 = Instant::now();
+            let e = m.embed_text(text, prompt)?;
+            let dt = t1.elapsed();
+            let re = m.store.f32(&format!("tref.{j}.embedding"))?.to_vec();
+            let pe = m.store.f32(&format!("tref.{j}.npu_embedding"))?.to_vec();
+            let (c, cp) = (cosine(&e, &re), cosine(&e, &pe));
+            let pass = ids == rids && c >= 0.999;
+            ok &= pass;
+            ids_ok += (ids == rids) as usize;
+            worst = worst.min(c);
+            let short: String = text.chars().take(40).collect::<String>().replace('\n', " ");
+            println!(
+                "  {j:2} {:>18} {:5} ids {}, cos {c:.6} / {cp:.6}, {:.0} ms {:?}{} -- {}",
+                prompt.unwrap_or("-"),
+                ids.len(),
+                if ids == rids { "equal" } else { "DIFFER" },
+                dt.as_secs_f64() * 1e3,
+                short,
+                if text.chars().count() > 40 { "..." } else { "" },
+                if pass { "ok" } else { "FAIL" }
+            );
+        }
+        println!("  ids equal {ids_ok}/{}, worst cosine {worst:.6}", trefs.len());
+    }
     println!("{}", if ok { "ALL CHECKS PASSED" } else { "CHECKS FAILED" });
     Ok(ok)
+}
+
+fn prompts(args: &[String]) -> R<()> {
+    let dir = Path::new(args.first().ok_or("give a bundle")?);
+    let m = taconite_bundle::Manifest::load(dir, taconite_embeddinggemma2::VERSION)?;
+    for r in m.tagged("prompt") {
+        println!("{:22} {:?}", r.field(0)?, hex_text(r.field(1)?));
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -196,10 +275,12 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("embed") => embed(&args[1..]).map(|_| true),
         Some("check") => check(&args[1..]),
+        Some("prompts") => prompts(&args[1..]).map(|_| true),
         _ => {
             eprintln!(
-                "usage:\n  embeddinggemma2 embed <bundle> <image>... [--dim 768|512|256|128] [-o out.f32] [--reps N]\n  \
-                 embeddinggemma2 check <bundle>"
+                "usage:\n  embeddinggemma2 embed <bundle> [<image>...] [--text <text>]... [--prompt <name>]\n  \
+                 \x20                     [--dim 768|512|256|128] [-o out.f32] [--reps N]\n  \
+                 embeddinggemma2 prompts <bundle>\n  embeddinggemma2 check <bundle>"
             );
             return ExitCode::from(2);
         }

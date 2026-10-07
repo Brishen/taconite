@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use taconite::Timing;
-use taconite::cpu::{self, Attn, Rows as KvRows, par_rows};
+use taconite::cpu::{self, par_rows};
 use taconite_bundle::Store;
 
 use crate::npu::{Buffer, Npu, Rows};
@@ -340,10 +340,10 @@ impl Model {
         Ok(out)
     }
 
-    /// Soft tokens `[s, 512]` -> the unit `[768]` embedding.
-    pub fn text(&mut self, c: &Config, npu: &Npu, soft: &[f32], t: &mut Timing) -> Result<Vec<f32>, Error> {
-        let (d, eps, lp, nl) = (c.d, c.eps, c.ple, c.layers);
-        let t0 = Instant::now();
+    /// Soft tokens `[s, 512]` -> the encoder's input embeddings of
+    /// `<bos> <|image> soft... <image|> <eos>`.
+    pub fn image_sequence(&self, c: &Config, soft: &[f32]) -> Vec<f32> {
+        let d = c.d;
         let tok = |j: usize| &self.tok[j * d..(j + 1) * d];
         let mut x = Vec::with_capacity(soft.len() + 4 * d);
         x.extend_from_slice(tok(0));
@@ -351,9 +351,18 @@ impl Model {
         x.extend_from_slice(soft);
         x.extend_from_slice(tok(2));
         x.extend_from_slice(tok(3));
+        x
+    }
+
+    /// The text encoder over input embeddings x `[T, 512]` -> the unit
+    /// `[768]` embedding (mean over the tokens, projected, normalized).
+    pub fn text(&mut self, c: &Config, npu: &Npu, x: Vec<f32>, t: &mut Timing) -> Result<Vec<f32>, Error> {
+        let (d, eps, lp, nl) = (c.d, c.eps, c.ple, c.layers);
+        let mut x = x;
+        let t0 = Instant::now();
         let n = x.len() / d;
-        if n > c.window || n > c.t_rows {
-            return Err(Error::Input(format!("{n} tokens (at most {})", c.window.min(c.t_rows))));
+        if n == 0 || n > c.t_rows {
+            return Err(Error::Input(format!("{n} tokens (1..={})", c.t_rows)));
         }
         self.tb.a.put(&x, d)?;
         t.add("t.host", t0.elapsed());
@@ -435,50 +444,78 @@ impl Model {
     }
 
     /// Layer `li`'s attention over its qkv `[n, (H + 2 KV) hd]`: q / k / v
-    /// norms, 1D RoPE, bidirectional attention with score scale 1 (every
-    /// token is inside the sliding window) -> `[n, H hd]`.
+    /// norms, 1D RoPE, bidirectional attention with score scale 1, a
+    /// sliding layer's keys within |i - j| <= window -> `[n, H hd]`.
     fn text_attention(&self, c: &Config, li: usize, qkv: &[f32], n: usize) -> Vec<f32> {
         let (h, hd, kvh, eps) = (c.heads, c.hd[li], c.kv_heads[li], c.eps);
         let w = (h + 2 * kvh) * hd;
         let l = &self.tl[li];
         let theta = if c.global[li] { c.theta_g } else { c.theta_s };
         let inv: Vec<f32> = (0..hd / 2).map(|j| 1.0 / theta.powf((2 * j) as f32 / hd as f32)).collect();
-        let dim = h * hd;
-        let (mut q, mut k, mut v) = (vec![0f32; n * dim], vec![0f32; n * dim], vec![0f32; n * dim]);
-        // cpu::attention scales scores by 1 / sqrt(hd): undone on q
-        let qs = (hd as f32).sqrt();
+        let (dim, kdim) = (h * hd, kvh * hd);
+        let (mut q, mut k, mut v) = (vec![0f32; n * dim], vec![0f32; n * kdim], vec![0f32; n * kdim]);
+        let mut cs = vec![0f32; n * hd];
+        let mut sn = vec![0f32; n * hd];
         for r in 0..n {
-            let (mut cs, mut sn) = (vec![0f32; hd], vec![0f32; hd]);
             for (j, &f) in inv.iter().enumerate() {
                 let (s, co) = (r as f32 * f).sin_cos();
-                cs[j] = co;
-                cs[j + hd / 2] = co;
-                sn[j] = s;
-                sn[j + hd / 2] = s;
-            }
-            let row = &qkv[r * w..(r + 1) * w];
-            for hh in 0..h {
-                let dst = &mut q[r * dim + hh * hd..r * dim + (hh + 1) * hd];
-                dst.copy_from_slice(&row[hh * hd..(hh + 1) * hd]);
-                rms_row(dst, eps, Some(&l.q_norm));
-                rope_half(dst, &cs, &sn);
-                dst.iter_mut().for_each(|x| *x *= qs);
-            }
-            for kh in 0..kvh {
-                let mut kk = row[(h + kh) * hd..(h + kh + 1) * hd].to_vec();
-                rms_row(&mut kk, eps, Some(&l.k_norm));
-                rope_half(&mut kk, &cs, &sn);
-                let mut vv = row[(h + kvh + kh) * hd..(h + kvh + kh + 1) * hd].to_vec();
-                rms_row(&mut vv, eps, None);
-                // GQA: the kv head serves h / kvh query heads
-                for g in 0..h / kvh {
-                    let hh = kh * (h / kvh) + g;
-                    k[r * dim + hh * hd..r * dim + (hh + 1) * hd].copy_from_slice(&kk);
-                    v[r * dim + hh * hd..r * dim + (hh + 1) * hd].copy_from_slice(&vv);
+                for k in [j, j + hd / 2] {
+                    cs[r * hd + k] = co;
+                    sn[r * hd + k] = s;
                 }
             }
         }
-        let a = Attn { heads: h, ..Default::default() };
-        cpu::attention(&q, dim, KvRows::f32(&k, dim), KvRows::f32(&v, dim), &a)
+        let qn = &l.q_norm[..];
+        par_rows(&mut q, dim, |r0, piece| {
+            for (ri, row) in piece.chunks_mut(dim).enumerate() {
+                let r = r0 + ri;
+                let (c_, s_) = (&cs[r * hd..(r + 1) * hd], &sn[r * hd..(r + 1) * hd]);
+                for (hh, dst) in row.chunks_mut(hd).enumerate() {
+                    dst.copy_from_slice(&qkv[r * w + hh * hd..r * w + (hh + 1) * hd]);
+                    rms_row(dst, eps, Some(qn));
+                    rope_half(dst, c_, s_);
+                }
+            }
+        });
+        for r in 0..n {
+            let (c_, s_) = (&cs[r * hd..(r + 1) * hd], &sn[r * hd..(r + 1) * hd]);
+            for kh in 0..kvh {
+                let kk = &mut k[r * kdim + kh * hd..r * kdim + (kh + 1) * hd];
+                kk.copy_from_slice(&qkv[r * w + (h + kh) * hd..r * w + (h + kh + 1) * hd]);
+                rms_row(kk, eps, Some(&l.k_norm));
+                rope_half(kk, c_, s_);
+                let vv = &mut v[r * kdim + kh * hd..r * kdim + (kh + 1) * hd];
+                vv.copy_from_slice(&qkv[r * w + (h + kvh + kh) * hd..r * w + (h + kvh + kh + 1) * hd]);
+                rms_row(vv, eps, None);
+            }
+        }
+        // a sliding layer's window, where it cuts anything off
+        let win = if !c.global[li] && n > c.window + 1 { c.window } else { n };
+        let group = h / kvh;
+        let mut out = vec![0f32; n * dim];
+        par_rows(&mut out, dim, |r0, piece| {
+            let mut s = vec![0f32; n];
+            for (ri, orow) in piece.chunks_mut(dim).enumerate() {
+                let i = r0 + ri;
+                let (lo, hi) = (i.saturating_sub(win), (i + win + 1).min(n));
+                for hh in 0..h {
+                    let kh = hh / group;
+                    let qh = &q[i * dim + hh * hd..i * dim + (hh + 1) * hd];
+                    let sc = &mut s[..hi - lo];
+                    for (j, sj) in (lo..hi).zip(sc.iter_mut()) {
+                        *sj = cpu::dot(qh, &k[j * kdim + kh * hd..j * kdim + (kh + 1) * hd]);
+                    }
+                    cpu::softmax_(sc);
+                    let oh = &mut orow[hh * hd..(hh + 1) * hd];
+                    oh.fill(0.0);
+                    for (j, &p) in (lo..hi).zip(sc.iter()) {
+                        for (o, &x) in oh.iter_mut().zip(&v[j * kdim + kh * hd..j * kdim + (kh + 1) * hd]) {
+                            *o += p * x;
+                        }
+                    }
+                }
+            }
+        });
+        out
     }
 }

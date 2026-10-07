@@ -3,10 +3,10 @@
 
 [package]
 name = "taconite-embeddinggemma2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "EmbeddingGemma 2 image embeddings on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
+description = "EmbeddingGemma 2 image and text embeddings on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
 license = "Apache-2.0 AND BSD-3-Clause AND MIT-CMU"
 readme = "README.md"
 repository = "https://github.com/Brishen/taconite"

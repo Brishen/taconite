@@ -24,7 +24,7 @@ from Rust.
 | [`taconite-gaic`](taconite-gaic) | GAIC (VGG16) image cropping (`gaic` binary) |
 | [`taconite-adaface`](taconite-adaface) | AdaFace IR-18 / IR-101 face embeddings, an embeddable library |
 | [`taconite-qwen35`](taconite-qwen35) | Qwen3.5-2B chat: a hybrid Gated DeltaNet / attention LLM, prefill GEMMs and decode GEMVs on the NPU (`qwen35` binary) |
-| [`taconite-embeddinggemma2`](taconite-embeddinggemma2) | EmbeddingGemma 2 image embeddings in its shared text / image space (`embeddinggemma2` binary) |
+| [`taconite-embeddinggemma2`](taconite-embeddinggemma2) | EmbeddingGemma 2 image and text embeddings in one space, with the model's task prompts (`embeddinggemma2` binary) |
 | [`taconite-sapiens2`](taconite-sapiens2) | Sapiens2-Pose 0.4B: 308 whole-body keypoints (body, feet, hands, face) for a person box (`sapiens2` binary) |
 
 Each crate is its own package (there is no workspace); each one's README
