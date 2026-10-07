@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sapiens2-Pose 0.4B (`facebook/sapiens2-pose-0.4b`) on an AMD XDNA NPU:
+//! Sapiens2-Pose (`facebook/sapiens2-pose-0.4b`, `-1b`) on an AMD XDNA NPU:
 //! a person box in an image -> 308 keypoints (body, feet, hands, face).
 //!
 //! The bundle `iron/applications/sapiens2_pose/export_sapiens2.py` writes
@@ -11,7 +11,7 @@
 //!
 //! | | NPU | host (here) |
 //! |---|---|---|
-//! | backbone (ViT, 24 layers, 1024 wide, 3081 tokens) | every projection (`flm.GEMM`s: patch embedding, qkv, o, the SwiGLU gate+up, down) and the attention (the MHA operator) | the box crop (`preprocess.rs`), RMSNorms, q / k norms, 2D RoPE, residual adds |
+//! | backbone (ViT, 3081 tokens; 0.4b: 24 layers, 1024 wide, 1b: 40 layers, 1536 wide) | every projection (`flm.GEMM`s: patch embedding, qkv, o, the SwiGLU gate+up, down) and the attention (the MHA operator) | the box crop (`preprocess.rs`), RMSNorms, q / k norms, 2D RoPE, residual adds |
 //! | head (2 transposed convs to 256 x 192, 3 1 x 1 convs, the predictor) | every convolution as an `flm.GEMM` (a transposed conv as one GEMM over its input's 2 x 2 windows) | the window layout, InstanceNorm + SiLU |
 //! | keypoints | | argmax + DARK refinement, back through the crop (`post.rs`) |
 //!
@@ -35,7 +35,9 @@ use npu::Npu;
 pub use post::Keypoint;
 pub use preprocess::BBox;
 
-pub const VERSION: u32 = 1;
+/// The bundle format: 2 when some GEMM leaves its bias to the host
+/// (`<i>.down.bias`, `d<j>.bias`: 1b); 1 (0.4b) is read too.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub enum Error {
@@ -177,7 +179,7 @@ impl Sapiens2 {
     /// Loads a bundle: opens the NPU and uploads the packed weights
     /// (kernels load on first use; [`Npu::preload`] loads them now).
     pub fn load(dir: &Path) -> Result<Self, Error> {
-        let manifest = Manifest::load(dir, VERSION)?;
+        let manifest = Manifest::load(dir, VERSION).or_else(|e| Manifest::load(dir, 1).map_err(|_| e))?;
         let store = Store::load(dir)?;
         let cfg = Config::load(&manifest)?;
         let npu = Npu::open(&manifest)?;

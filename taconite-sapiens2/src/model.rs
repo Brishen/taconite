@@ -33,6 +33,9 @@ struct Layer {
     o: Buffer,
     gu: Buffer,
     down: Buffer,
+    /// down's bias when the bundle leaves it to the host (a K too deep for
+    /// an NPU-side bias, as on 1b)
+    down_bias: Option<Vec<f32>>,
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
 }
@@ -42,6 +45,8 @@ pub struct Model {
     prefix: Vec<f32>,
     layers: Vec<Layer>,
     deconv: Vec<Buffer>,
+    /// each transposed convolution's host-side bias `[4 C_out]`, if any
+    deconv_bias: Vec<Option<Vec<f32>>>,
     convs: Vec<Buffer>,
     pred: Buffer,
     cos: Vec<f32>,
@@ -62,6 +67,10 @@ pub struct Model {
 
 fn f32s(s: &Store, name: &str) -> Result<Vec<f32>, Error> {
     Ok(s.f32(name)?.to_vec())
+}
+
+fn opt_f32s(s: &Store, name: &str) -> Result<Option<Vec<f32>>, Error> {
+    s.has(name).then(|| f32s(s, name)).transpose()
 }
 
 #[inline]
@@ -99,6 +108,15 @@ fn add_from(x: &mut [f32], c: &Flat) -> Result<(), Error> {
         piece.iter_mut().zip(&src[r0 * P..]).for_each(|(v, &b)| *v += bf16_to_f32(b));
     });
     Ok(())
+}
+
+/// Every row of x `[rows, bias.len()]` += bias.
+fn add_bias(x: &mut [f32], bias: &[f32]) {
+    par_rows(x, bias.len(), |_, piece| {
+        for row in piece.chunks_mut(bias.len()) {
+            row.iter_mut().zip(bias).for_each(|(v, &b)| *v += b);
+        }
+    });
 }
 
 /// Rotates x by cos / sin, half-split (`rotate_half`).
@@ -169,6 +187,7 @@ impl Model {
                 o: up(&format!("{i}.o"))?,
                 gu: up(&format!("{i}.gu"))?,
                 down: up(&format!("{i}.down"))?,
+                down_bias: opt_f32s(s, &format!("{i}.down.bias"))?,
                 q_norm: f32s(s, &format!("{i}.q_norm"))?,
                 k_norm: f32s(s, &format!("{i}.k_norm"))?,
             });
@@ -189,6 +208,7 @@ impl Model {
             prefix: f32s(s, "prefix")?,
             layers,
             deconv: (0..c.up.len()).map(|j| up(&format!("d{j}"))).collect::<Result<_, _>>()?,
+            deconv_bias: (0..c.up.len()).map(|j| opt_f32s(s, &format!("d{j}.bias"))).collect::<Result<_, _>>()?,
             convs: (0..c.convs.len()).map(|j| up(&format!("c{j}"))).collect::<Result<_, _>>()?,
             pred: up("pred")?,
             cos: f32s(s, "rope.cos")?,
@@ -293,6 +313,9 @@ impl Model {
             npu.run_gemm("down", &self.gu, &self.layers[li].down, &self.c, t)?;
             let t0 = Instant::now();
             add_from(&mut x, &self.c)?;
+            if let Some(b) = &self.layers[li].down_bias {
+                add_bias(&mut x, b);
+            }
             t.add("host", t0.elapsed());
         }
         let t0 = Instant::now();
@@ -331,13 +354,18 @@ impl Model {
             // phase (a, b) of window (sy, sx) -> output (2 (sy - a) + a, ...)
             let (oh, ow) = (2 * h0, 2 * w0);
             let mut y = vec![0f32; oh * ow * co];
+            let bias = self.deconv_bias[j].as_deref();
             par_rows(&mut y, co, |r0, piece| {
                 for (ri, row) in piece.chunks_mut(co).enumerate() {
                     let (oy, ox) = ((r0 + ri) / ow, (r0 + ri) % ow);
                     let (a, b) = (oy % 2, ox % 2);
                     let (sy, sx) = (oy / 2 + a, ox / 2 + b);
-                    let src = &cb[(sy * (w0 + 2) + sx) * g.n + (2 * a + b) * co..][..co];
+                    let ph = (2 * a + b) * co;
+                    let src = &cb[(sy * (w0 + 2) + sx) * g.n + ph..][..co];
                     row.iter_mut().zip(src).for_each(|(o, &v)| *o = bf16_to_f32(v));
+                    if let Some(bias) = bias {
+                        row.iter_mut().zip(&bias[ph..ph + co]).for_each(|(o, &v)| *o += v);
+                    }
                 }
             });
             inorm_silu(&mut y, co, c.in_eps);

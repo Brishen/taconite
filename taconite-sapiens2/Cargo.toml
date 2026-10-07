@@ -3,7 +3,7 @@
 
 [package]
 name = "taconite-sapiens2"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Sapiens2-Pose (308 whole-body keypoints) on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
