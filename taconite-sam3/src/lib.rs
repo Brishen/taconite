@@ -438,6 +438,14 @@ impl Sam3 {
         (self.npu.loads, self.npu.evictions)
     }
 
+    /// Frees every NPU hardware context the model holds, for another model
+    /// in the process (NPU2 has 16 across every process, and SAM 3 alone
+    /// can take 15); the kernels load again on the model's next run. The
+    /// number of contexts freed.
+    pub fn release_contexts(&mut self) -> usize {
+        self.npu.release()
+    }
+
     fn time<T>(&mut self, key: &str, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
         let t0 = Instant::now();
         let r = f(self)?;

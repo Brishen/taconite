@@ -4,14 +4,15 @@
 //! `sapiens2`: Sapiens2-Pose keypoints on the NPU.
 //!
 //! ```text
-//! sapiens2 pose <bundle> <image> [--box x,y,w,h]... [--threshold 0.3] [-o overlay.png] [--json out.json] [--reps N]
+//! sapiens2 pose <bundle> <image> [--box x,y,w,h]... [--threshold 0.3] [-o overlay.png] [--json out.json] [--reps N] [--release]
 //! sapiens2 check <bundle>
 //! ```
 //!
 //! `pose` runs every box (COCO x, y, width, height; default: the whole
 //! image) and prints each one's keypoints above the threshold; `-o` draws
 //! them over the image (body + feet red, hands green, face blue), `--json`
-//! writes every keypoint. `check` runs the bundle's reference cases against
+//! writes every keypoint; `--release` frees the model's NPU contexts after
+//! every run (they load again on the next). `check` runs the bundle's reference cases against
 //! the float32 HF model's results.
 
 use std::fmt::Write as _;
@@ -102,8 +103,14 @@ fn pose(args: &[String]) -> R<()> {
     let dir = Path::new(args.first().ok_or("give a bundle")?);
     let img_path = PathBuf::from(args.get(1).ok_or("give an image")?);
     let (mut boxes, mut out, mut json, mut reps, mut threshold) = (Vec::new(), None, None, 1, 0.3f32);
+    let mut release = false;
     let mut i = 2;
     while i < args.len() {
+        if args[i] == "--release" {
+            release = true;
+            i += 1;
+            continue;
+        }
         let v = args.get(i + 1).ok_or_else(|| format!("{} needs a value", args[i]))?;
         match args[i].as_str() {
             "--box" => boxes.push(parse_box(v)?),
@@ -132,6 +139,9 @@ fn pose(args: &[String]) -> R<()> {
             let t1 = Instant::now();
             kps = m.pose(img.as_raw(), w, h, b)?;
             eprintln!("box {b:?}: {:.0} ms; {}", t1.elapsed().as_secs_f64() * 1e3, timing_line(&m));
+            if release {
+                eprintln!("  released {} hardware contexts", m.release_contexts());
+            }
         }
         let shown = kps.iter().filter(|k| k.score > threshold).count();
         let mean = kps.iter().map(|k| k.score).sum::<f32>() / kps.len() as f32;
@@ -262,7 +272,7 @@ fn main() -> ExitCode {
         Some("check") => check(&args[1..]),
         _ => {
             eprintln!(
-                "usage:\n  sapiens2 pose <bundle> <image> [--box x,y,w,h]... [--threshold 0.3] [-o overlay.png] [--json out.json] [--reps N]\n  \
+                "usage:\n  sapiens2 pose <bundle> <image> [--box x,y,w,h]... [--threshold 0.3] [-o overlay.png] [--json out.json] [--reps N] [--release]\n  \
                  sapiens2 check <bundle>"
             );
             return ExitCode::from(2);

@@ -332,6 +332,16 @@ impl Npu {
         true
     }
 
+    /// Drops every loaded kernel, freeing this model's hardware contexts
+    /// for other models (they load again, patched, on next use); the number
+    /// of contexts freed.
+    pub fn release(&mut self) -> usize {
+        let n = self.lru.len();
+        self.loaded.clear();
+        self.lru.clear();
+        n
+    }
+
     /// Runs `io`'s kernel over every chunk with weights `w`; A must be synced.
     pub fn run(&mut self, io: &Io, w: &Buffer) -> Result<Duration, Error> {
         let k = self.kernel(&io.key)?;

@@ -190,6 +190,13 @@ impl Sapiens2 {
         self.npu.contexts
     }
 
+    /// Frees every NPU hardware context the model holds, for another model
+    /// in the process (NPU2 has 16 across every process); the kernels load
+    /// again on the next call. The number of contexts freed.
+    pub fn release_contexts(&mut self) -> usize {
+        self.npu.release()
+    }
+
     /// RGB8 `[h, w, 3]` and a box -> the model's input `[3, H, W]`.
     pub fn preprocess(&self, rgb: &[u8], w: usize, h: usize, b: &BBox) -> Result<Vec<f32>, Error> {
         if rgb.len() != w * h * 3 || w < 2 || h < 2 {

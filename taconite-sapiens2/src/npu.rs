@@ -31,8 +31,10 @@ use crate::Error;
 const BF16: usize = 2;
 /// Elements a worker converts at a time.
 const PIECE: usize = 1 << 16;
-/// 100 ms waits for a hardware context when every slot is taken.
-const WAITS: usize = 200;
+/// 100 ms waits for a hardware context when every slot is taken by others
+/// (another program's run may end soon; a model this process keeps
+/// resident won't, so the wait is short).
+const WAITS: usize = 50;
 
 /// One compiled `flm.GEMM` at its row count (a `gemm` record).
 #[derive(Debug, Clone)]
@@ -249,7 +251,11 @@ impl Npu {
                             // nothing of ours left to give up: other
                             // programs hold every slot; wait for one
                             if waits >= WAITS {
-                                return Err(e);
+                                return Err(Error::Npu(format!(
+                                    "{e}: every NPU hardware context is taken by other models or \
+                                     programs (NPU2 has 16); free some (e.g. another model's \
+                                     `release_contexts`) and try again"
+                                )));
                             }
                             waits += 1;
                             drop((ks, used));
@@ -265,6 +271,18 @@ impl Npu {
         }
         let ks = self.kernels.borrow();
         f(&ks[key])
+    }
+
+    /// Drops every loaded kernel, freeing this model's hardware contexts
+    /// for others (they load again on next use); the number freed.
+    pub fn release(&self) -> usize {
+        let mut ks = self.kernels.borrow_mut();
+        let mut ctxs: Vec<&str> = ks.keys().map(|k| self.srcs[k].ctx.as_str()).collect();
+        ctxs.sort();
+        ctxs.dedup();
+        let n = ctxs.len();
+        ks.clear();
+        n
     }
 
     /// Loads the kernels now rather than on first use, as many as the
