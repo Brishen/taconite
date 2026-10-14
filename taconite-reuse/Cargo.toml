@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Brishen Hawkins
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "taconite-reuse"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "NVIDIA RE-USE universal speech enhancement (SEMamba, 8-48 kHz) on an AMD XDNA NPU: IRON kernels replayed through XRT or directly through the amdxdna driver"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Brishen/taconite"
+keywords = ["npu", "xdna", "speech-enhancement", "denoising", "amd"]
+categories = ["multimedia::audio", "science", "command-line-utilities"]
+
+[features]
+default = ["cli", "xrt"]
+# The `reuse` binary (WAV in, WAV out).
+cli = []
+# Run the kernels through XRT (taconite's `xrt` feature: XRT's headers and
+# library at build time).
+xrt = ["taconite/xrt"]
+# Run the kernels through the amdxdna driver's ioctls (`taconite::direct`)
+# instead of XRT; it wins when both are on. For a build with no XRT at all:
+# `--no-default-features --features cli,direct`.
+direct = []
+# MP3, M4A / AAC, FLAC and WAV in (`media`, symphonia) and the
+# `reuse-clean` binary.
+decode = ["dep:symphonia"]
+# MP3 (LAME, LGPL) and M4A / AAC (Fraunhofer FDK AAC) out, built from their
+# vendored sources: `reuse-clean` then writes the input's format.
+encode = ["dep:mp3lame-sys", "dep:fdk-aac"]
+# Build a bundle into the binary: REUSE_EMBED_BUNDLE=/abs/path/to/bundle at
+# build time (~55 MB); `Reuse::load_embedded`, and the binaries use it when
+# given no bundle.
+embed = []
+
+[dependencies]
+taconite-bundle = { version = "0.1.0", path = "../taconite-bundle" }
+taconite = { version = "0.1.1", path = "../taconite", default-features = false }
+rustfft = "6"
+mp3lame-sys = { version = "0.1.11", optional = true }
+fdk-aac = { version = "0.8", optional = true }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3", "aac", "isomp4", "flac", "wav", "pcm"] }
+
+[[bin]]
+name = "reuse"
+required-features = ["cli"]
+
+[[bin]]
+name = "reuse-clean"
+required-features = ["cli", "decode"]
+
+# docs.rs has no XRT; taconite's build.rs skips the shim there. Not
+# `embed` (needs a bundle at build time) or `encode` (builds C codecs).
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+features = ["cli", "xrt", "direct", "decode"]
+
+[profile.release]
+debug = 1

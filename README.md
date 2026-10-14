@@ -26,6 +26,7 @@ from Rust.
 | [`taconite-qwen35`](taconite-qwen35) | Qwen3.5-2B chat: a hybrid Gated DeltaNet / attention LLM, prefill GEMMs and decode GEMVs on the NPU (`qwen35` binary) |
 | [`taconite-embeddinggemma2`](taconite-embeddinggemma2) | EmbeddingGemma 2 image and text embeddings in one space, with the model's task prompts (`embeddinggemma2` binary) |
 | [`taconite-sapiens2`](taconite-sapiens2) | Sapiens2-Pose 0.4B / 1B: 308 whole-body keypoints (body, feet, hands, face) for a person box (`sapiens2` binary) |
+| [`taconite-reuse`](taconite-reuse) | NVIDIA RE-USE universal speech enhancement (SEMamba), 8-48 kHz, every convolution and Mamba scan on the NPU (`reuse` and `reuse-clean` binaries; MP3 / M4A / FLAC / WAV in) |
 
 Each crate is its own package (there is no workspace); each one's README
 covers its build, usage, accuracy and speed.
@@ -61,6 +62,7 @@ Prebuilt NPU2 bundles are on Hugging Face:
 - EmbeddingGemma 2: [`brishen/iron-embeddinggemma2-npu2`](https://huggingface.co/brishen/iron-embeddinggemma2-npu2)
 - Sapiens2-Pose 0.4B: [`brishen/iron-sapiens2-pose-0.4b-npu2`](https://huggingface.co/brishen/iron-sapiens2-pose-0.4b-npu2),
   1B: [`brishen/iron-sapiens2-pose-1b-npu2`](https://huggingface.co/brishen/iron-sapiens2-pose-1b-npu2)
+- RE-USE: [`brishen/iron-reuse-npu2`](https://huggingface.co/brishen/iron-reuse-npu2)
 
 ## Requirements
 
